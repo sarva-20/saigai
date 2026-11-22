@@ -60,6 +60,8 @@ def main() -> None:
             cv2.imshow("saigai", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+    except KeyboardInterrupt:
+        pass
     finally:
         camera.release()
         tracker.close()
