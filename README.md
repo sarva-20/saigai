@@ -14,5 +14,10 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
+If macOS reports that the camera is not authorized, open **System Settings >
+Privacy & Security > Camera** and enable access for the app running the terminal
+(for example, Terminal or Visual Studio Code). Fully quit and reopen that app,
+then run `python main.py` again. Close apps that may already be using the camera.
+
 The viewer does not control the cursor by default. Reserved live control can be
 enabled later with `python main.py --live`.

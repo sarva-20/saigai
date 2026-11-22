@@ -22,7 +22,12 @@ def main() -> None:
     controller = Controller(live=args.live)
     camera = cv2.VideoCapture(0)
     if not camera.isOpened():
-        raise RuntimeError("Could not open the default webcam")
+        camera.release()
+        raise SystemExit(
+            "Could not open the default webcam.\n"
+            "On macOS, grant camera access in System Settings -> Privacy & Security -> Camera "
+            "to Terminal or your IDE, then reopen it and run python main.py again."
+        )
 
     tracker = HandTracker()
     previous_time = time.perf_counter()
