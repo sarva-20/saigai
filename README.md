@@ -21,3 +21,7 @@ then run `python main.py` again. Close apps that may already be using the camera
 
 The viewer does not control the cursor by default. Reserved live control can be
 enabled later with `python main.py --live`.
+
+Without `--live`, saigai draws a preview dot where the cursor would move. Pass
+`--live` only after verifying the preview, since it enables real Quartz cursor
+movement. Clicking is not implemented.

@@ -4,6 +4,8 @@ import time
 import cv2
 
 from controller import Controller
+from config import GESTURE_THRESHOLDS
+from gestures import OneEuroFilter, map_index_finger_to_screen
 from tracker import HandTracker, draw_landmarks
 
 
@@ -30,6 +32,15 @@ def main() -> None:
         )
 
     tracker = HandTracker()
+    screen_width, screen_height = controller.screen_size()
+    x_filter = OneEuroFilter(
+        min_cutoff=GESTURE_THRESHOLDS.one_euro_min_cutoff,
+        beta=GESTURE_THRESHOLDS.one_euro_beta,
+    )
+    y_filter = OneEuroFilter(
+        min_cutoff=GESTURE_THRESHOLDS.one_euro_min_cutoff,
+        beta=GESTURE_THRESHOLDS.one_euro_beta,
+    )
     previous_time = time.perf_counter()
     fps = 0.0
 
@@ -43,6 +54,33 @@ def main() -> None:
             timestamp_ms = int(time.perf_counter() * 1000)
             hands = tracker.process(frame, timestamp_ms)
             draw_landmarks(frame, hands)
+
+            if hands:
+                index_finger = hands[0][8]
+                cursor_x, cursor_y = map_index_finger_to_screen(
+                    index_finger,
+                    frame.shape[1],
+                    frame.shape[0],
+                    screen_width,
+                    screen_height,
+                    GESTURE_THRESHOLDS.active_region_margin,
+                )
+                timestamp_seconds = timestamp_ms / 1000.0
+                cursor_x = x_filter(cursor_x, timestamp_seconds)
+                cursor_y = y_filter(cursor_y, timestamp_seconds)
+
+                if args.live:
+                    controller.move_mouse(cursor_x, cursor_y)
+                else:
+                    preview_x = int(cursor_x / screen_width * frame.shape[1])
+                    preview_y = int(cursor_y / screen_height * frame.shape[0])
+                    cv2.circle(
+                        frame,
+                        (preview_x, preview_y),
+                        8,
+                        (255, 0, 255),
+                        -1,
+                    )
 
             current_time = time.perf_counter()
             fps = 0.9 * fps + 0.1 * (1.0 / max(current_time - previous_time, 1e-6))
