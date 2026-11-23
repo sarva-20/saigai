@@ -24,4 +24,6 @@ enabled later with `python main.py --live`.
 
 Without `--live`, saigai draws a preview dot where the cursor would move. Pass
 `--live` only after verifying the preview, since it enables real Quartz cursor
-movement. Clicking is not implemented.
+movement. Pinch and release performs a left click; holding the pinch while
+moving performs a left-button drag. Clicking and dragging are only enabled with
+`--live`.

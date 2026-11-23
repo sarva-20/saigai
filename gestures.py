@@ -2,6 +2,7 @@
 
 from math import pi
 from math import dist
+from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
 
@@ -20,6 +21,62 @@ def is_pinching(
         return False
 
     return landmark_distance(landmarks[4], landmarks[8]) < threshold
+
+
+def normalized_pinch_distance(landmarks: Sequence[Sequence[float]]) -> float:
+    """Return thumb-index distance normalized by wrist-to-middle-MCP size."""
+    if len(landmarks) <= 9:
+        raise ValueError("hand landmarks must include landmarks 0, 4, 8, and 9")
+
+    hand_size = landmark_distance(landmarks[0], landmarks[9])
+    if hand_size <= 0:
+        raise ValueError("hand size must be positive")
+    return landmark_distance(landmarks[4], landmarks[8]) / hand_size
+
+
+@dataclass(frozen=True)
+class PinchEvent:
+    pressed: bool = False
+    released: bool = False
+    clicked: bool = False
+    dragging: bool = False
+
+
+class PinchStateMachine:
+    """Hysteretic pinch state machine with click and drag classification."""
+
+    def __init__(
+        self,
+        press_threshold: float,
+        release_threshold: float,
+        click_max_duration: float = 0.30,
+    ) -> None:
+        if press_threshold <= 0 or release_threshold <= press_threshold:
+            raise ValueError("release threshold must exceed a positive press threshold")
+        if click_max_duration <= 0:
+            raise ValueError("click_max_duration must be positive")
+        self.press_threshold = press_threshold
+        self.release_threshold = release_threshold
+        self.click_max_duration = click_max_duration
+        self.pressed = False
+        self._press_time: Optional[float] = None
+
+    def update(self, normalized_distance: float, timestamp: float) -> PinchEvent:
+        if not self.pressed:
+            if normalized_distance <= self.press_threshold:
+                self.pressed = True
+                self._press_time = timestamp
+                return PinchEvent(pressed=True)
+            return PinchEvent()
+
+        if normalized_distance < self.release_threshold:
+            return PinchEvent(dragging=True)
+
+        press_time = self._press_time
+        self.pressed = False
+        self._press_time = None
+        clicked = press_time is not None and timestamp - press_time < self.click_max_duration
+        return PinchEvent(released=True, clicked=clicked)
 
 
 def map_index_finger_to_screen(

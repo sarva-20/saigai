@@ -5,7 +5,12 @@ import cv2
 
 from controller import Controller
 from config import GESTURE_THRESHOLDS
-from gestures import OneEuroFilter, map_index_finger_to_screen
+from gestures import (
+    OneEuroFilter,
+    PinchStateMachine,
+    map_index_finger_to_screen,
+    normalized_pinch_distance,
+)
 from tracker import HandTracker, draw_landmarks
 
 
@@ -41,6 +46,13 @@ def main() -> None:
         min_cutoff=GESTURE_THRESHOLDS.one_euro_min_cutoff,
         beta=GESTURE_THRESHOLDS.one_euro_beta,
     )
+    pinch = PinchStateMachine(
+        press_threshold=GESTURE_THRESHOLDS.pinch_press_threshold,
+        release_threshold=GESTURE_THRESHOLDS.pinch_release_threshold,
+        click_max_duration=GESTURE_THRESHOLDS.click_max_duration,
+    )
+    freeze_frames = 0
+    cursor_position = (screen_width / 2, screen_height / 2)
     previous_time = time.perf_counter()
     fps = 0.0
 
@@ -57,7 +69,7 @@ def main() -> None:
 
             if hands:
                 index_finger = hands[0][8]
-                cursor_x, cursor_y = map_index_finger_to_screen(
+                target_x, target_y = map_index_finger_to_screen(
                     index_finger,
                     frame.shape[1],
                     frame.shape[0],
@@ -66,20 +78,54 @@ def main() -> None:
                     GESTURE_THRESHOLDS.active_region_margin,
                 )
                 timestamp_seconds = timestamp_ms / 1000.0
-                cursor_x = x_filter(cursor_x, timestamp_seconds)
-                cursor_y = y_filter(cursor_y, timestamp_seconds)
+                pinch_event = pinch.update(
+                    normalized_pinch_distance(hands[0]),
+                    timestamp_seconds,
+                )
 
-                if args.live:
+                if pinch_event.pressed:
+                    freeze_frames = GESTURE_THRESHOLDS.pinch_freeze_frames
+                    controller.mouse_down(*cursor_position)
+                elif pinch_event.released:
+                    controller.mouse_up(*cursor_position)
+
+                if freeze_frames > 0:
+                    freeze_frames -= 1
+                elif not pinch.pressed:
+                    cursor_x = x_filter(target_x, timestamp_seconds)
+                    cursor_y = y_filter(target_y, timestamp_seconds)
+                    cursor_position = (cursor_x, cursor_y)
                     controller.move_mouse(cursor_x, cursor_y)
-                else:
-                    preview_x = int(cursor_x / screen_width * frame.shape[1])
-                    preview_y = int(cursor_y / screen_height * frame.shape[0])
-                    cv2.circle(
+                elif pinch_event.dragging:
+                    cursor_x = x_filter(target_x, timestamp_seconds)
+                    cursor_y = y_filter(target_y, timestamp_seconds)
+                    cursor_position = (cursor_x, cursor_y)
+                    controller.mouse_dragged(cursor_x, cursor_y)
+
+                if not args.live:
+                    state = "PINCH" if pinch.pressed else "READY"
+                    cv2.putText(
                         frame,
-                        (preview_x, preview_y),
-                        8,
-                        (255, 0, 255),
-                        -1,
+                        state,
+                        (10, 65),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 0, 255) if pinch.pressed else (0, 255, 0),
+                        2,
+                    )
+            elif pinch.pressed:
+                pinch_event = pinch.update(float("inf"), timestamp_ms / 1000.0)
+                if pinch_event.released:
+                    controller.mouse_up(*cursor_position)
+                if not args.live:
+                    cv2.putText(
+                        frame,
+                        "NO HAND",
+                        (10, 65),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 165, 255),
+                        2,
                     )
 
             current_time = time.perf_counter()

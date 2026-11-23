@@ -44,3 +44,43 @@ class Controller:
             return True
         except ImportError as exc:
             raise RuntimeError("Quartz mouse control requires macOS") from exc
+
+    def _mouse_event(self, event_type: int, x: float, y: float) -> bool:
+        if not self.live:
+            return False
+
+        try:
+            import Quartz
+
+            point = Quartz.CGPoint(x=x, y=y)
+            event = Quartz.CGEventCreateMouseEvent(
+                None,
+                event_type,
+                point,
+                Quartz.kCGMouseButtonLeft,
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+            return True
+        except ImportError as exc:
+            raise RuntimeError("Quartz mouse control requires macOS") from exc
+
+    def mouse_down(self, x: float, y: float) -> bool:
+        try:
+            import Quartz
+        except ImportError as exc:
+            raise RuntimeError("Quartz mouse control requires macOS") from exc
+        return self._mouse_event(Quartz.kCGEventLeftMouseDown, x, y)
+
+    def mouse_dragged(self, x: float, y: float) -> bool:
+        try:
+            import Quartz
+        except ImportError as exc:
+            raise RuntimeError("Quartz mouse control requires macOS") from exc
+        return self._mouse_event(Quartz.kCGEventLeftMouseDragged, x, y)
+
+    def mouse_up(self, x: float, y: float) -> bool:
+        try:
+            import Quartz
+        except ImportError as exc:
+            raise RuntimeError("Quartz mouse control requires macOS") from exc
+        return self._mouse_event(Quartz.kCGEventLeftMouseUp, x, y)
