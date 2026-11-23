@@ -38,3 +38,8 @@ configured gain and speed acceleration.
 
 Press `d` in the preview window to toggle raw/smoothed pointer positions,
 pinch-ratio thresholds, FPS, and per-frame latency.
+
+Use `python main.py --calibrate` to sample the four screen corners. The saved
+`calibration.json` active region is loaded automatically and is ignored by Git.
+The live output worker runs at the configured 120 Hz rate; it is disabled
+without `--live`.

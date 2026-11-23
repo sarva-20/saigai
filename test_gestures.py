@@ -2,8 +2,10 @@ import unittest
 
 from gestures import (
     OneEuroFilter,
+    PointerHistory,
     PinchStateMachine,
     ScrollStateMachine,
+    StillnessLock,
     get_pointer_anchor,
     is_scroll_pose,
     map_index_finger_to_screen,
@@ -23,8 +25,19 @@ class GestureTests(unittest.TestCase):
             active_region_margin=0.20,
         )
 
-        self.assertEqual(x, 1000.0)
+        self.assertEqual(x, 0.0)
         self.assertEqual(y, 0.0)
+
+        right_up = map_index_finger_to_screen(
+            (0.8, 0.2, 0.0),
+            100,
+            100,
+            1000,
+            500,
+            0.20,
+        )
+        self.assertGreater(right_up[0], x)
+        self.assertEqual(right_up[1], y)
 
     def test_pointer_anchor_defaults_to_palm_and_supports_fingertip(self) -> None:
         landmarks = [[0.0, 0.0, 0.0] for _ in range(21)]
@@ -48,8 +61,39 @@ class GestureTests(unittest.TestCase):
             gain=1.0,
             acceleration=0.0,
         )
-        self.assertAlmostEqual(delta[0], -100.0)
+        self.assertAlmostEqual(delta[0], 100.0)
         self.assertAlmostEqual(delta[1], 0.0)
+
+    def test_inversion_escape_hatches(self) -> None:
+        normal = map_index_finger_to_screen(
+            (0.8, 0.2, 0.0), 100, 100, 1000, 500, 0.20
+        )
+        inverted = map_index_finger_to_screen(
+            (0.8, 0.2, 0.0),
+            100,
+            100,
+            1000,
+            500,
+            0.20,
+            invert_x=True,
+            invert_y=True,
+        )
+        self.assertEqual(normal, (1000.0, 0.0))
+        self.assertEqual(inverted, (0.0, 500.0))
+
+    def test_stillness_lock_releases_after_motion(self) -> None:
+        lock = StillnessLock(0.01)
+        self.assertFalse(lock.update((0.5, 0.5, 0.0)))
+        self.assertTrue(lock.update((0.505, 0.505, 0.0)))
+        self.assertFalse(lock.update((0.6, 0.5, 0.0)))
+
+    def test_pointer_history_latches_earlier_position(self) -> None:
+        history = PointerHistory(4)
+        history.add((10.0, 10.0), 1.00)
+        history.add((20.0, 20.0), 1.05)
+        history.add((30.0, 30.0), 1.10)
+        self.assertEqual(history.latch(1.20, 160), (10.0, 10.0))
+        self.assertEqual(history.latch(1.20, 110), (20.0, 20.0))
 
     def test_one_euro_filter_smooths_movement(self) -> None:
         smoothing = OneEuroFilter(min_cutoff=1.0, beta=0.007)

@@ -3,6 +3,8 @@
 from math import pi
 from math import dist
 from dataclasses import dataclass
+from collections import deque
+from time import monotonic
 from typing import Optional, Sequence, Tuple
 
 
@@ -92,6 +94,8 @@ def relative_pointer_delta(
     gain: float = 1.0,
     acceleration: float = 0.35,
     speed_reference: float = 0.8,
+    invert_x: bool = False,
+    invert_y: bool = False,
 ) -> Tuple[float, float]:
     """Convert normalized hand motion into mirrored, accelerated screen motion."""
     if delta_time <= 0 or screen_width <= 0 or screen_height <= 0:
@@ -104,10 +108,59 @@ def relative_pointer_delta(
     speed = (delta_x**2 + delta_y**2) ** 0.5 / delta_time
     speed_ratio = min(speed / speed_reference, 1.0)
     motion_gain = gain * (1.0 + acceleration * speed_ratio)
+    if invert_x:
+        delta_x = -delta_x
+    if invert_y:
+        delta_y = -delta_y
     return (
-        -delta_x * screen_width * motion_gain,
+        delta_x * screen_width * motion_gain,
         delta_y * screen_height * motion_gain,
     )
+
+
+class StillnessLock:
+    def __init__(self, threshold: float) -> None:
+        if threshold < 0:
+            raise ValueError("stillness threshold must be non-negative")
+        self.threshold = threshold
+        self._previous: Optional[Sequence[float]] = None
+        self.locked = False
+
+    def update(self, position: Sequence[float]) -> bool:
+        if self._previous is None:
+            self._previous = position
+            return False
+        movement = landmark_distance(self._previous, position)
+        self._previous = position
+        self.locked = movement <= self.threshold
+        return self.locked
+
+
+class PointerHistory:
+    def __init__(self, max_length: int = 32) -> None:
+        if max_length <= 0:
+            raise ValueError("max_length must be positive")
+        self._positions: deque[Tuple[float, Tuple[float, float]]] = deque(
+            maxlen=max_length
+        )
+
+    def add(
+        self,
+        position: Tuple[float, float],
+        timestamp: Optional[float] = None,
+    ) -> None:
+        self._positions.append((monotonic() if timestamp is None else timestamp, position))
+
+    def latch(
+        self,
+        timestamp: float,
+        milliseconds_earlier: float,
+    ) -> Optional[Tuple[float, float]]:
+        target = timestamp - milliseconds_earlier / 1000.0
+        candidates = [position for time, position in self._positions if time <= target]
+        if candidates:
+            return candidates[-1]
+        return self._positions[0][1] if self._positions else None
 
 
 @dataclass(frozen=True)
@@ -223,6 +276,9 @@ def map_pointer_to_screen(
     screen_width: float,
     screen_height: float,
     active_region_margin: float = 0.20,
+    active_region: Optional[Tuple[float, float, float, float]] = None,
+    invert_x: bool = False,
+    invert_y: bool = False,
 ) -> Tuple[float, float]:
     """Map normalized landmark 8 coordinates into the active screen region."""
     if not 0.0 <= active_region_margin < 0.5:
@@ -234,17 +290,24 @@ def map_pointer_to_screen(
 
     x = float(landmark[0])
     y = float(landmark[1])
-    left = active_region_margin
-    right = 1.0 - active_region_margin
-    top = active_region_margin
-    bottom = 1.0 - active_region_margin
+    if active_region is None:
+        left = active_region_margin
+        right = 1.0 - active_region_margin
+        top = active_region_margin
+        bottom = 1.0 - active_region_margin
+    else:
+        left, top, right, bottom = active_region
+        if not 0 <= left < right <= 1 or not 0 <= top < bottom <= 1:
+            raise ValueError("active_region must contain normalized bounds")
 
     normalized_x = (max(left, min(right, x)) - left) / (right - left)
     normalized_y = (max(top, min(bottom, y)) - top) / (bottom - top)
 
-    # Mirroring the horizontal axis makes fingertip movement follow the
-    # mirrored preview naturally.
-    return (1.0 - normalized_x) * screen_width, normalized_y * screen_height
+    if invert_x:
+        normalized_x = 1.0 - normalized_x
+    if invert_y:
+        normalized_y = 1.0 - normalized_y
+    return normalized_x * screen_width, normalized_y * screen_height
 
 
 def map_index_finger_to_screen(*args, **kwargs) -> Tuple[float, float]:

@@ -1,18 +1,22 @@
 import argparse
+import json
 import time
+from pathlib import Path
 from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 
-from controller import Controller
+from controller import Controller, CursorOutput
 from config import GESTURE_THRESHOLDS
 from gestures import (
     OneEuroFilter,
+    PointerHistory,
     PinchStateMachine,
     ScrollStateMachine,
+    StillnessLock,
     get_pointer_anchor,
-    map_index_finger_to_screen,
+    map_pointer_to_screen,
     normalized_pinch_distance,
     relative_pointer_delta,
 )
@@ -37,6 +41,90 @@ def clamp_pointer(
     )
 
 
+def load_calibration(path: Path) -> Optional[Tuple[float, float, float, float]]:
+    if not path.exists():
+        return None
+    with path.open() as calibration_file:
+        values = json.load(calibration_file)
+    return tuple(values[key] for key in ("left", "top", "right", "bottom"))
+
+
+def calibrate(
+    camera: cv2.VideoCapture,
+    tracker: HandTracker,
+    path: Path,
+) -> None:
+    labels = ("TOP-LEFT", "TOP-RIGHT", "BOTTOM-RIGHT", "BOTTOM-LEFT")
+    samples: list[Tuple[float, float]] = []
+    for label in labels:
+        start = time.perf_counter()
+        while time.perf_counter() - start < GESTURE_THRESHOLDS.calibration_countdown_seconds:
+            success, frame = read_latest_frame(camera)
+            if not success or frame is None:
+                continue
+            # The camera image is mirrored exactly once here; mapping does not mirror it again.
+            frame = cv2.flip(frame, 1)
+            remaining = GESTURE_THRESHOLDS.calibration_countdown_seconds - (
+                time.perf_counter() - start
+            )
+            cv2.putText(
+                frame,
+                f"Point {label} - {max(1, int(remaining) + 1)}",
+                (30, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 255),
+                2,
+            )
+            cv2.imshow("saigai calibration", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                raise KeyboardInterrupt
+
+        collected: list[Tuple[float, float]] = []
+        start = time.perf_counter()
+        while time.perf_counter() - start < GESTURE_THRESHOLDS.calibration_sample_seconds:
+            success, frame = read_latest_frame(camera)
+            if not success or frame is None:
+                continue
+            frame = cv2.flip(frame, 1)
+            hands = tracker.process(frame, int(time.perf_counter() * 1000))
+            draw_landmarks(frame, hands)
+            if hands:
+                anchor = get_pointer_anchor(
+                    hands[0],
+                    GESTURE_THRESHOLDS.pointer_anchor,
+                    GESTURE_THRESHOLDS.palm_anchor_mcp_weight,
+                )
+                collected.append((anchor[0], anchor[1]))
+            cv2.putText(
+                frame,
+                f"Hold {label}",
+                (30, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0),
+                2,
+            )
+            cv2.imshow("saigai calibration", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                raise KeyboardInterrupt
+        if not collected:
+            raise RuntimeError(f"No hand landmarks collected for {label}")
+        samples.append(
+            (
+                sum(point[0] for point in collected) / len(collected),
+                sum(point[1] for point in collected) / len(collected),
+            )
+        )
+
+    left = (samples[0][0] + samples[3][0]) / 2
+    top = (samples[0][1] + samples[1][1]) / 2
+    right = (samples[1][0] + samples[2][0]) / 2
+    bottom = (samples[2][1] + samples[3][1]) / 2
+    with path.open("w") as calibration_file:
+        json.dump({"left": left, "top": top, "right": right, "bottom": bottom}, calibration_file)
+
+
 def draw_debug_overlay(
     frame: np.ndarray,
     raw_position: Optional[Tuple[float, float]],
@@ -48,6 +136,7 @@ def draw_debug_overlay(
     release_threshold: float,
     fps: float,
     latency_ms: float,
+    output_rate_hz: float,
 ) -> None:
     height, width = frame.shape[:2]
 
@@ -60,6 +149,15 @@ def draw_debug_overlay(
     if raw_position is not None:
         cv2.circle(frame, preview_point(raw_position), 7, (0, 255, 255), 2)
     cv2.circle(frame, preview_point(smoothed_position), 7, (255, 0, 255), 2)
+    cv2.putText(
+        frame,
+        "raw target (yellow) / actual cursor (magenta)",
+        (10, 190),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1,
+    )
 
     if pinch_ratio is not None:
         bar_x, bar_y, bar_width, bar_height = 10, 95, 250, 18
@@ -97,7 +195,7 @@ def draw_debug_overlay(
 
     cv2.putText(
         frame,
-        f"FPS {fps:.1f}  latency {latency_ms:.1f} ms",
+        f"FPS {fps:.1f}  latency {latency_ms:.1f} ms  output {output_rate_hz:.0f} Hz",
         (10, 165),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -112,6 +210,11 @@ def parse_args() -> argparse.Namespace:
         "--live",
         action="store_true",
         help="enable OS cursor and scroll control",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="calibrate the active screen region and exit",
     )
     return parser.parse_args()
 
@@ -134,6 +237,16 @@ def main() -> None:
 
     tracker = HandTracker()
     screen_width, screen_height = controller.screen_size()
+    calibration_path = Path(__file__).resolve().parent / GESTURE_THRESHOLDS.calibration_file
+    if args.calibrate:
+        try:
+            calibrate(camera, tracker, calibration_path)
+        finally:
+            camera.release()
+            tracker.close()
+            cv2.destroyAllWindows()
+        return
+    active_region = load_calibration(calibration_path)
     x_filter = OneEuroFilter(
         min_cutoff=GESTURE_THRESHOLDS.one_euro_min_cutoff,
         beta=GESTURE_THRESHOLDS.one_euro_beta,
@@ -158,10 +271,20 @@ def main() -> None:
         min_cutoff=GESTURE_THRESHOLDS.scroll_min_cutoff,
         beta=GESTURE_THRESHOLDS.scroll_beta,
     )
+    stillness = StillnessLock(GESTURE_THRESHOLDS.stillness_threshold)
+    history = PointerHistory(GESTURE_THRESHOLDS.pointer_history_size)
     freeze_frames = 0
     cursor_position = (screen_width / 2, screen_height / 2)
+    press_position = cursor_position
     previous_anchor: Optional[Tuple[float, float, float]] = None
     previous_pointer_time: Optional[float] = None
+    output = CursorOutput(
+        controller,
+        cursor_position,
+        GESTURE_THRESHOLDS.output_rate_hz,
+        GESTURE_THRESHOLDS.output_smoothing_time_constant,
+    )
+    output.start()
     debug_overlay = False
     previous_time = time.perf_counter()
     fps = 0.0
@@ -216,6 +339,8 @@ def main() -> None:
                             GESTURE_THRESHOLDS.pointer_gain,
                             GESTURE_THRESHOLDS.pointer_acceleration,
                             GESTURE_THRESHOLDS.pointer_speed_reference,
+                            GESTURE_THRESHOLDS.invert_x,
+                            GESTURE_THRESHOLDS.invert_y,
                         )
                         raw_position = clamp_pointer(
                             (cursor_position[0] + delta[0], cursor_position[1] + delta[1]),
@@ -223,24 +348,37 @@ def main() -> None:
                             screen_height,
                         )
                 elif GESTURE_THRESHOLDS.pointer_mode == "absolute":
-                    raw_position = map_index_finger_to_screen(
+                    raw_position = map_pointer_to_screen(
                         anchor,
                         frame.shape[1],
                         frame.shape[0],
                         screen_width,
                         screen_height,
                         GESTURE_THRESHOLDS.active_region_margin,
+                        active_region,
+                        GESTURE_THRESHOLDS.invert_x,
+                        GESTURE_THRESHOLDS.invert_y,
                     )
                 else:
                     raise ValueError("pointer_mode must be 'absolute' or 'relative'")
                 previous_anchor = anchor
                 previous_pointer_time = timestamp_seconds
+                history.add(raw_position, timestamp_seconds)
+                is_still = stillness.update(anchor)
 
                 if pinch_event.pressed:
                     freeze_frames = GESTURE_THRESHOLDS.pinch_freeze_frames
-                    controller.mouse_down(*cursor_position)
+                    press_position = history.latch(
+                        timestamp_seconds,
+                        GESTURE_THRESHOLDS.latch_ms,
+                    ) or cursor_position
+                    output.set_enabled(True)
+                    output.set_dragging(False)
+                    output.set_target(press_position)
+                    controller.mouse_down(*press_position)
                 elif pinch_event.released:
-                    controller.mouse_up(*cursor_position)
+                    output.set_dragging(False)
+                    controller.mouse_up(*press_position)
 
                 if pinch.pressed:
                     if freeze_frames > 0:
@@ -249,8 +387,10 @@ def main() -> None:
                         cursor_x = x_filter(raw_position[0], timestamp_seconds)
                         cursor_y = y_filter(raw_position[1], timestamp_seconds)
                         cursor_position = (cursor_x, cursor_y)
-                        controller.mouse_dragged(cursor_x, cursor_y)
+                        output.set_target(cursor_position)
+                        output.set_dragging(True)
                 elif scroll_event.active:
+                    output.set_enabled(False)
                     if scroll_event.delta:
                         controller.scroll(scroll_event.delta)
                     if not args.live:
@@ -265,11 +405,14 @@ def main() -> None:
                         )
                 elif freeze_frames > 0:
                     freeze_frames -= 1
+                elif is_still:
+                    output.set_enabled(True)
                 else:
                     cursor_x = x_filter(raw_position[0], timestamp_seconds)
                     cursor_y = y_filter(raw_position[1], timestamp_seconds)
                     cursor_position = (cursor_x, cursor_y)
-                    controller.move_mouse(cursor_x, cursor_y)
+                    output.set_enabled(True)
+                    output.set_target(cursor_position)
 
                 if not args.live and pinch.pressed:
                     state = "PINCH" if pinch.pressed else "READY"
@@ -288,7 +431,8 @@ def main() -> None:
                 pinch_event = pinch.update(float("inf"), timestamp_ms / 1000.0)
                 scroll.update(None, timestamp_ms / 1000.0, pinch_active=True)
                 if pinch_event.released:
-                    controller.mouse_up(*cursor_position)
+                    output.set_dragging(False)
+                    controller.mouse_up(*press_position)
                 if not args.live:
                     cv2.putText(
                         frame,
@@ -327,10 +471,13 @@ def main() -> None:
                 2,
             )
             if debug_overlay:
+                actual_position = (
+                    output.actual_position if args.live else cursor_position
+                )
                 draw_debug_overlay(
                     frame,
                     raw_position if hands else None,
-                    cursor_position,
+                    actual_position,
                     screen_width,
                     screen_height,
                     pinch_ratio if hands else None,
@@ -338,6 +485,7 @@ def main() -> None:
                     GESTURE_THRESHOLDS.pinch_release_threshold,
                     fps,
                     (time.perf_counter() - frame_started) * 1000.0,
+                    GESTURE_THRESHOLDS.output_rate_hz if args.live else 0.0,
                 )
 
             cv2.imshow("saigai", frame)
@@ -351,6 +499,7 @@ def main() -> None:
     finally:
         camera.release()
         tracker.close()
+        output.stop()
         cv2.destroyAllWindows()
 
 

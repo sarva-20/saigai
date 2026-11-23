@@ -1,6 +1,9 @@
 """Quartz mouse and scroll control with a live-action safety gate."""
 
 from dataclasses import dataclass
+from math import exp
+from threading import Event, Lock, Thread
+from time import monotonic, sleep
 from typing import Optional
 
 
@@ -102,3 +105,79 @@ class Controller:
             return True
         except ImportError as exc:
             raise RuntimeError("Quartz scroll control requires macOS") from exc
+
+
+class CursorOutput:
+    """Live-only output loop that smoothly follows the latest target."""
+
+    def __init__(
+        self,
+        controller: Controller,
+        initial_position: tuple[float, float],
+        rate_hz: float = 120.0,
+        smoothing_time_constant: float = 0.08,
+    ) -> None:
+        if rate_hz <= 0 or smoothing_time_constant <= 0:
+            raise ValueError("output rate and smoothing time constant must be positive")
+        self.controller = controller
+        self.rate_hz = rate_hz
+        self.smoothing_time_constant = smoothing_time_constant
+        self._target = initial_position
+        self._actual = initial_position
+        self._enabled = True
+        self._dragging = False
+        self._lock = Lock()
+        self._stop = Event()
+        self._thread: Optional[Thread] = None
+
+    @property
+    def actual_position(self) -> tuple[float, float]:
+        with self._lock:
+            return self._actual
+
+    def set_target(self, position: tuple[float, float]) -> None:
+        with self._lock:
+            self._target = position
+
+    def set_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._enabled = enabled
+
+    def set_dragging(self, dragging: bool) -> None:
+        with self._lock:
+            self._dragging = dragging
+
+    def start(self) -> None:
+        if not self.controller.live or self._thread is not None:
+            return
+        self._thread = Thread(target=self._run, name="saigai-cursor-output", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def _run(self) -> None:
+        interval = 1.0 / self.rate_hz
+        previous = monotonic()
+        while not self._stop.is_set():
+            now = monotonic()
+            delta_time = max(now - previous, 0.0)
+            previous = now
+            with self._lock:
+                alpha = 1.0 - exp(-delta_time / self.smoothing_time_constant)
+                self._actual = (
+                    self._actual[0] + (self._target[0] - self._actual[0]) * alpha,
+                    self._actual[1] + (self._target[1] - self._actual[1]) * alpha,
+                )
+                position = self._actual
+                enabled = self._enabled
+                dragging = self._dragging
+            if enabled:
+                if dragging:
+                    self.controller.mouse_dragged(*position)
+                else:
+                    self.controller.move_mouse(*position)
+            self._stop.wait(interval)
