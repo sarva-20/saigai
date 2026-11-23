@@ -30,3 +30,11 @@ moving performs a left-button drag. Clicking and dragging are only enabled with
 
 With two fingers extended and the ring and pinky curled, vertical movement
 scrolls instead of moving the cursor. Scroll events are also live-only.
+
+The pointer defaults to a palm anchor, which avoids the index fingertip moving
+when pinching. Set `pointer_anchor` to `fingertip` or `mcp` in `config.py` if
+needed. `pointer_mode` can be `absolute` or `relative`; relative mode uses the
+configured gain and speed acceleration.
+
+Press `d` in the preview window to toggle raw/smoothed pointer positions,
+pinch-ratio thresholds, FPS, and per-frame latency.

@@ -4,9 +4,11 @@ from gestures import (
     OneEuroFilter,
     PinchStateMachine,
     ScrollStateMachine,
+    get_pointer_anchor,
     is_scroll_pose,
     map_index_finger_to_screen,
     normalized_pinch_distance,
+    relative_pointer_delta,
 )
 
 
@@ -23,6 +25,31 @@ class GestureTests(unittest.TestCase):
 
         self.assertEqual(x, 1000.0)
         self.assertEqual(y, 0.0)
+
+    def test_pointer_anchor_defaults_to_palm_and_supports_fingertip(self) -> None:
+        landmarks = [[0.0, 0.0, 0.0] for _ in range(21)]
+        landmarks[0] = [0.0, 0.0, 0.0]
+        landmarks[5] = [1.0, 0.5, 0.0]
+        landmarks[8] = [0.2, 0.8, 0.0]
+
+        self.assertEqual(get_pointer_anchor(landmarks), (0.7, 0.35, 0.0))
+        self.assertEqual(
+            get_pointer_anchor(landmarks, "fingertip"),
+            (0.2, 0.8, 0.0),
+        )
+
+    def test_relative_pointer_delta_applies_gain_and_acceleration(self) -> None:
+        delta = relative_pointer_delta(
+            (0.5, 0.5, 0.0),
+            (0.6, 0.5, 0.0),
+            delta_time=1.0,
+            screen_width=1000,
+            screen_height=1000,
+            gain=1.0,
+            acceleration=0.0,
+        )
+        self.assertAlmostEqual(delta[0], -100.0)
+        self.assertAlmostEqual(delta[1], 0.0)
 
     def test_one_euro_filter_smooths_movement(self) -> None:
         smoothing = OneEuroFilter(min_cutoff=1.0, beta=0.007)

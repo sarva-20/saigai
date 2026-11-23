@@ -49,6 +49,67 @@ def is_scroll_pose(
     return index_extended and middle_extended and ring_curled and pinky_curled
 
 
+def get_pointer_anchor(
+    landmarks: Sequence[Sequence[float]],
+    anchor: str = "palm",
+    palm_mcp_weight: float = 0.70,
+) -> Tuple[float, float, float]:
+    """Return a stable pointer anchor without using the pinching fingertips."""
+    if len(landmarks) <= 8:
+        raise ValueError("hand landmarks must include landmark 8")
+    if not 0.0 <= palm_mcp_weight <= 1.0:
+        raise ValueError("palm_mcp_weight must be between 0 and 1")
+
+    if anchor == "fingertip":
+        return (
+            float(landmarks[8][0]),
+            float(landmarks[8][1]),
+            float(landmarks[8][2]),
+        )
+    if anchor == "mcp":
+        return (
+            float(landmarks[5][0]),
+            float(landmarks[5][1]),
+            float(landmarks[5][2]),
+        )
+    if anchor == "palm":
+        wrist = landmarks[0]
+        mcp = landmarks[5]
+        return tuple(
+            (1.0 - palm_mcp_weight) * float(wrist[index])
+            + palm_mcp_weight * float(mcp[index])
+            for index in range(3)
+        )
+    raise ValueError("anchor must be 'palm', 'mcp', or 'fingertip'")
+
+
+def relative_pointer_delta(
+    previous: Sequence[float],
+    current: Sequence[float],
+    delta_time: float,
+    screen_width: float,
+    screen_height: float,
+    gain: float = 1.0,
+    acceleration: float = 0.35,
+    speed_reference: float = 0.8,
+) -> Tuple[float, float]:
+    """Convert normalized hand motion into mirrored, accelerated screen motion."""
+    if delta_time <= 0 or screen_width <= 0 or screen_height <= 0:
+        raise ValueError("time and screen dimensions must be positive")
+    if gain <= 0 or acceleration < 0 or speed_reference <= 0:
+        raise ValueError("gain and speed_reference must be positive")
+
+    delta_x = float(current[0] - previous[0])
+    delta_y = float(current[1] - previous[1])
+    speed = (delta_x**2 + delta_y**2) ** 0.5 / delta_time
+    speed_ratio = min(speed / speed_reference, 1.0)
+    motion_gain = gain * (1.0 + acceleration * speed_ratio)
+    return (
+        -delta_x * screen_width * motion_gain,
+        delta_y * screen_height * motion_gain,
+    )
+
+
 @dataclass(frozen=True)
 class PinchEvent:
     pressed: bool = False
@@ -155,7 +216,7 @@ class ScrollStateMachine:
         return ScrollEvent(active=True, delta=delta)
 
 
-def map_index_finger_to_screen(
+def map_pointer_to_screen(
     landmark: Sequence[float],
     frame_width: int,
     frame_height: int,
@@ -186,9 +247,14 @@ def map_index_finger_to_screen(
     return (1.0 - normalized_x) * screen_width, normalized_y * screen_height
 
 
+def map_index_finger_to_screen(*args, **kwargs) -> Tuple[float, float]:
+    """Compatibility alias for the original absolute pointer mapping."""
+    return map_pointer_to_screen(*args, **kwargs)
+
+
 def map_to_screen(*args, **kwargs) -> Tuple[float, float]:
     """Backward-friendly short name for active-region screen mapping."""
-    return map_index_finger_to_screen(*args, **kwargs)
+    return map_pointer_to_screen(*args, **kwargs)
 
 
 class OneEuroFilter:
