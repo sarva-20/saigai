@@ -43,3 +43,10 @@ Use `python main.py --calibrate` to sample the four screen corners. The saved
 `calibration.json` active region is loaded automatically and is ignored by Git.
 The live output worker runs at the configured 120 Hz rate; it is disabled
 without `--live`.
+
+Press `d` for pinch, finger-pose, scroll-delta, FPS, and latency diagnostics.
+The preview and debug overlay show `READY`, `PINCHING`, `CLICK`, `DRAGGING`,
+`NO HAND`, and the last event log.
+
+Run `python main.py --selftest-scroll` to post down/up Quartz scroll events
+every 0.5 seconds for approximately 5 seconds without opening the camera.

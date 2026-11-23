@@ -36,19 +36,56 @@ def normalized_pinch_distance(landmarks: Sequence[Sequence[float]]) -> float:
     return landmark_distance(landmarks[4], landmarks[8]) / hand_size
 
 
+def normalized_thumb_middle_distance(
+    landmarks: Sequence[Sequence[float]],
+) -> float:
+    if len(landmarks) <= 12:
+        raise ValueError("hand landmarks must include thumb tip and middle tip")
+    hand_size = landmark_distance(landmarks[0], landmarks[9])
+    if hand_size <= 0:
+        raise ValueError("hand size must be positive")
+    return landmark_distance(landmarks[4], landmarks[12]) / hand_size
+
+
 def is_scroll_pose(
     landmarks: Sequence[Sequence[float]],
     pinch_active: bool = False,
+    extension_threshold: float = 1.15,
 ) -> bool:
-    """Return whether index/middle are extended and ring/pinky are curled."""
+    """Detect two-finger scroll independent of hand orientation."""
     if len(landmarks) <= 20 or pinch_active:
         return False
-
-    index_extended = landmarks[8][1] < landmarks[6][1]
-    middle_extended = landmarks[12][1] < landmarks[10][1]
-    ring_curled = landmarks[16][1] > landmarks[14][1]
-    pinky_curled = landmarks[20][1] > landmarks[18][1]
+    extensions = finger_extension_states(landmarks, extension_threshold)
+    index_extended = extensions["index"]
+    middle_extended = extensions["middle"]
+    ring_extended = extensions["ring"]
+    pinky_extended = extensions["pinky"]
+    ring_curled = not ring_extended
+    pinky_curled = not pinky_extended
     return index_extended and middle_extended and ring_curled and pinky_curled
+
+
+def finger_extension_states(
+    landmarks: Sequence[Sequence[float]],
+    threshold: float = 1.15,
+) -> dict[str, bool]:
+    if len(landmarks) <= 20:
+        return {name: False for name in ("index", "middle", "ring", "pinky")}
+    wrist = landmarks[0]
+    values = {}
+    for name, tip, pip in (
+        ("index", 8, 6),
+        ("middle", 12, 10),
+        ("ring", 16, 14),
+        ("pinky", 20, 18),
+    ):
+        tip_distance = landmark_distance(wrist, landmarks[tip])
+        pip_distance = landmark_distance(wrist, landmarks[pip])
+        values[name] = (
+            pip_distance > 0
+            and tip_distance / pip_distance >= threshold
+        )
+    return values
 
 
 def get_pointer_anchor(
@@ -209,11 +246,147 @@ class PinchStateMachine:
 
 
 @dataclass(frozen=True)
+class InteractionEvent:
+    state: str = "READY"
+    left_pressed: bool = False
+    right_pressed: bool = False
+    left_released: bool = False
+    left_clicked: bool = False
+    drag_started: bool = False
+    drag_ended: bool = False
+    right_clicked: bool = False
+
+
+class HandInteractionStateMachine:
+    def __init__(
+        self,
+        left_press: float,
+        left_release: float,
+        right_press: float,
+        right_release: float,
+        drag_hold_ms: float = 250.0,
+        click_max_duration: float = 0.30,
+        click_flash_ms: float = 400.0,
+    ) -> None:
+        self.left_press = left_press
+        self.left_release = left_release
+        self.right_press = right_press
+        self.right_release = right_release
+        self.drag_hold_ms = drag_hold_ms
+        self.click_max_duration = click_max_duration
+        self.click_flash_ms = click_flash_ms
+        self.mode: Optional[str] = None
+        self.state = "READY"
+        self._press_time: Optional[float] = None
+        self._click_flash_end: Optional[float] = None
+
+    def reset(self) -> InteractionEvent:
+        was_dragging = self.mode == "left" and self.state == "DRAGGING"
+        was_left = self.mode == "left"
+        self.mode = None
+        self._press_time = None
+        self._click_flash_end = None
+        self.state = "NO HAND"
+        return InteractionEvent(
+            state="NO HAND",
+            left_released=was_left,
+            drag_ended=was_dragging,
+        )
+
+    def update(
+        self,
+        left_ratio: float,
+        right_ratio: float,
+        timestamp: float,
+    ) -> InteractionEvent:
+        if self.state == "CLICK" and self._click_flash_end is not None:
+            if timestamp >= self._click_flash_end:
+                self.state = "READY"
+                self._click_flash_end = None
+            else:
+                return InteractionEvent(state="CLICK")
+
+        if self.mode is None:
+            if left_ratio <= self.left_press and right_ratio <= self.right_press:
+                if left_ratio <= right_ratio:
+                    kind = "left"
+                else:
+                    kind = "right"
+            elif left_ratio <= self.left_press:
+                kind = "left"
+            elif right_ratio <= self.right_press:
+                kind = "right"
+            else:
+                self.state = "READY"
+                return InteractionEvent(state="READY")
+
+            self.mode = kind
+            self._press_time = timestamp
+            self.state = "PINCHING"
+            event = InteractionEvent(state="PINCHING")
+            if kind == "left":
+                event = InteractionEvent(state="PINCHING", left_pressed=True)
+            else:
+                event = InteractionEvent(state="PINCHING", right_pressed=True)
+            return event
+
+        elapsed_ms = (
+            (timestamp - self._press_time) * 1000.0
+            if self._press_time is not None
+            else 0.0
+        )
+        if self.mode == "left":
+            if left_ratio >= self.left_release:
+                held_ms = elapsed_ms
+                quick_click = held_ms <= self.drag_hold_ms
+                was_dragging = held_ms > self.drag_hold_ms
+                self.mode = None
+                self._press_time = None
+                self.state = "CLICK" if quick_click else "READY"
+                if quick_click:
+                    self._click_flash_end = timestamp + self.click_flash_ms / 1000.0
+                return InteractionEvent(
+                    state=self.state,
+                    left_released=True,
+                    left_clicked=quick_click,
+                    drag_ended=was_dragging,
+                )
+            if elapsed_ms >= self.drag_hold_ms:
+                if self.state != "DRAGGING":
+                    self.state = "DRAGGING"
+                    return InteractionEvent(state="DRAGGING", drag_started=True)
+                return InteractionEvent(state="DRAGGING")
+            self.state = "PINCHING"
+            return InteractionEvent(state="PINCHING")
+
+        if right_ratio >= self.right_release:
+            held_ms = elapsed_ms
+            quick_click = held_ms <= self.click_max_duration * 1000.0
+            self.mode = None
+            self._press_time = None
+            self.state = "CLICK" if quick_click else "READY"
+            if quick_click:
+                self._click_flash_end = timestamp + self.click_flash_ms / 1000.0
+            return InteractionEvent(
+                state=self.state,
+                left_released=True,
+                right_clicked=quick_click,
+            )
+        self.state = "PINCHING"
+        return InteractionEvent(state="PINCHING")
+
+
+@dataclass(frozen=True)
 class ScrollEvent:
     active: bool = False
     started: bool = False
     ended: bool = False
     delta: float = 0.0
+    raw_midpoint_delta: float = 0.0
+    deadzone_delta: float = 0.0
+    scaled_delta: float = 0.0
+    sent_amount: int = 0
+    finger_states: dict[str, bool] | None = None
 
 
 class ScrollStateMachine:
@@ -224,6 +397,7 @@ class ScrollStateMachine:
         invert: bool = False,
         min_cutoff: float = 1.0,
         beta: float = 0.007,
+        extension_threshold: float = 1.15,
     ) -> None:
         if sensitivity <= 0 or dead_zone < 0:
             raise ValueError("sensitivity must be positive and dead_zone non-negative")
@@ -233,6 +407,14 @@ class ScrollStateMachine:
         self._filter = OneEuroFilter(min_cutoff=min_cutoff, beta=beta)
         self.active = False
         self._previous_y: Optional[float] = None
+        self.extension_threshold = extension_threshold
+        self.remainder = 0.0
+        self.last_diagnostics = {
+            "raw_midpoint_delta": 0.0,
+            "deadzone_delta": 0.0,
+            "scaled_delta": 0.0,
+            "sent_amount": 0,
+        }
 
     def update(
         self,
@@ -242,13 +424,29 @@ class ScrollStateMachine:
     ) -> ScrollEvent:
         pose_active = (
             landmarks is not None
-            and is_scroll_pose(landmarks, pinch_active=pinch_active)
+            and is_scroll_pose(
+                landmarks,
+                pinch_active=pinch_active,
+                extension_threshold=self.extension_threshold,
+            )
+        )
+        fingers = (
+            finger_extension_states(landmarks, self.extension_threshold)
+            if landmarks is not None
+            else {name: False for name in ("index", "middle", "ring", "pinky")}
         )
         if not pose_active:
             ended = self.active
             self.active = False
             self._previous_y = None
-            return ScrollEvent(ended=ended)
+            self.remainder = 0.0
+            self.last_diagnostics = {
+                "raw_midpoint_delta": 0.0,
+                "deadzone_delta": 0.0,
+                "scaled_delta": 0.0,
+                "sent_amount": 0,
+            }
+            return ScrollEvent(ended=ended, finger_states=fingers)
 
         midpoint_y = (landmarks[8][1] + landmarks[12][1]) / 2.0
         filtered_y = self._filter(midpoint_y, timestamp)
@@ -256,17 +454,38 @@ class ScrollStateMachine:
         self.active = True
         if started:
             self._previous_y = filtered_y
-            return ScrollEvent(active=True, started=True)
+            return ScrollEvent(active=True, started=True, finger_states=fingers)
 
         movement = filtered_y - self._previous_y
         self._previous_y = filtered_y
         if abs(movement) <= self.dead_zone:
-            return ScrollEvent(active=True)
+            return ScrollEvent(
+                active=True,
+                raw_midpoint_delta=movement,
+                finger_states=fingers,
+            )
 
         delta = -movement * self.sensitivity
         if self.invert:
             delta = -delta
-        return ScrollEvent(active=True, delta=delta)
+        combined = delta + self.remainder
+        sent_amount = int(combined)
+        self.remainder = combined - sent_amount
+        self.last_diagnostics = {
+            "raw_midpoint_delta": movement,
+            "deadzone_delta": movement,
+            "scaled_delta": delta,
+            "sent_amount": sent_amount,
+        }
+        return ScrollEvent(
+            active=True,
+            delta=float(sent_amount),
+            raw_midpoint_delta=movement,
+            deadzone_delta=movement,
+            scaled_delta=delta,
+            sent_amount=sent_amount,
+            finger_states=fingers,
+        )
 
 
 def map_pointer_to_screen(
