@@ -1,6 +1,7 @@
 import argparse
 import json
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -11,13 +12,15 @@ from controller import Controller, CursorOutput
 from config import GESTURE_THRESHOLDS
 from gestures import (
     OneEuroFilter,
+    HandInteractionStateMachine,
     PointerHistory,
-    PinchStateMachine,
     ScrollStateMachine,
     StillnessLock,
+    finger_extension_states,
     get_pointer_anchor,
     map_pointer_to_screen,
     normalized_pinch_distance,
+    normalized_thumb_middle_distance,
     relative_pointer_delta,
 )
 from tracker import HandTracker, draw_landmarks
@@ -39,6 +42,28 @@ def clamp_pointer(
         max(0.0, min(screen_width - 1.0, position[0])),
         max(0.0, min(screen_height - 1.0, position[1])),
     )
+
+
+class EventLog:
+    def __init__(self, limit: int = 5) -> None:
+        self.limit = limit
+        self.entries: deque[tuple[float, str]] = deque(maxlen=limit)
+
+    def add(self, timestamp: float, label: str) -> None:
+        self.entries.append((timestamp, label))
+
+    def draw(self, frame: np.ndarray) -> None:
+        base_y = frame.shape[0] - 20
+        for index, (timestamp, label) in enumerate(reversed(self.entries)):
+            cv2.putText(
+                frame,
+                f"{timestamp:.1f}s  {label}",
+                (10, base_y - index * 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (220, 220, 220),
+                1,
+            )
 
 
 def load_calibration(path: Path) -> Optional[Tuple[float, float, float, float]]:
@@ -137,6 +162,7 @@ def draw_debug_overlay(
     fps: float,
     latency_ms: float,
     output_rate_hz: float,
+    scroll_event=None,
 ) -> None:
     height, width = frame.shape[:2]
 
@@ -203,6 +229,56 @@ def draw_debug_overlay(
         1,
     )
 
+    if scroll_event is not None:
+        fingers = scroll_event.finger_states or {}
+        cv2.putText(
+            frame,
+            "finger " + " ".join(
+                f"{name[:1].upper()}={'T' if fingers.get(name, False) else 'C'}"
+                for name in ("index", "middle", "ring", "pinky")
+            ),
+            (10, 215),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+        )
+        cv2.putText(
+            frame,
+            (
+                f"scroll pose={scroll_event.active} "
+                f"raw={scroll_event.raw_midpoint_delta:+.4f} "
+                f"dead={scroll_event.deadzone_delta:+.4f}"
+            ),
+            (10, 238),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+        )
+        cv2.putText(
+            frame,
+            f"scaled={scroll_event.scaled_delta:+.2f} sent={scroll_event.sent_amount}",
+            (10, 261),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+        )
+
+
+def run_scroll_selftest() -> None:
+    controller = Controller(live=True)
+    screen_width, screen_height = controller.screen_size()
+    print("Posting scroll self-test events: down/up every 0.5 seconds")
+    started = time.monotonic()
+    direction = 1
+    while time.monotonic() - started < 5.0:
+        controller.scroll(direction * 120, screen_width / 2, screen_height / 2)
+        print("scroll", "down" if direction > 0 else "up")
+        time.sleep(0.5)
+        direction *= -1
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="saigai hand gesture webcam viewer")
@@ -216,11 +292,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="calibrate the active screen region and exit",
     )
+    parser.add_argument(
+        "--selftest-scroll",
+        action="store_true",
+        help="post alternating down/up scroll events for 5 seconds without a camera",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.selftest_scroll:
+        run_scroll_selftest()
+        return
     controller = Controller(live=args.live)
     camera = cv2.VideoCapture(0)
     camera.set(cv2.CAP_PROP_FRAME_WIDTH, GESTURE_THRESHOLDS.camera_width)
@@ -259,10 +343,18 @@ def main() -> None:
         min_cutoff=GESTURE_THRESHOLDS.pinch_min_cutoff,
         beta=GESTURE_THRESHOLDS.pinch_beta,
     )
-    pinch = PinchStateMachine(
-        press_threshold=GESTURE_THRESHOLDS.pinch_press_threshold,
-        release_threshold=GESTURE_THRESHOLDS.pinch_release_threshold,
+    right_filter = OneEuroFilter(
+        min_cutoff=GESTURE_THRESHOLDS.pinch_min_cutoff,
+        beta=GESTURE_THRESHOLDS.pinch_beta,
+    )
+    interaction = HandInteractionStateMachine(
+        left_press=GESTURE_THRESHOLDS.pinch_press_threshold,
+        left_release=GESTURE_THRESHOLDS.pinch_release_threshold,
+        right_press=GESTURE_THRESHOLDS.right_press_threshold,
+        right_release=GESTURE_THRESHOLDS.right_release_threshold,
+        drag_hold_ms=GESTURE_THRESHOLDS.drag_hold_ms,
         click_max_duration=GESTURE_THRESHOLDS.click_max_duration,
+        click_flash_ms=GESTURE_THRESHOLDS.click_flash_ms,
     )
     scroll = ScrollStateMachine(
         sensitivity=GESTURE_THRESHOLDS.scroll_sensitivity,
@@ -270,9 +362,11 @@ def main() -> None:
         invert=GESTURE_THRESHOLDS.scroll_invert,
         min_cutoff=GESTURE_THRESHOLDS.scroll_min_cutoff,
         beta=GESTURE_THRESHOLDS.scroll_beta,
+        extension_threshold=GESTURE_THRESHOLDS.finger_extension_threshold,
     )
     stillness = StillnessLock(GESTURE_THRESHOLDS.stillness_threshold)
     history = PointerHistory(GESTURE_THRESHOLDS.pointer_history_size)
+    event_log = EventLog()
     freeze_frames = 0
     cursor_position = (screen_width / 2, screen_height / 2)
     press_position = cursor_position
@@ -288,6 +382,9 @@ def main() -> None:
     debug_overlay = False
     previous_time = time.perf_counter()
     fps = 0.0
+    scroll_event = None
+    pinch_ratio = None
+    raw_position = None
 
     try:
         while True:
@@ -312,17 +409,21 @@ def main() -> None:
                     normalized_pinch_distance(hands[0]),
                     timestamp_seconds,
                 )
-                pinch_event = pinch.update(
-                    pinch_ratio,
+                right_ratio = right_filter(
+                    normalized_thumb_middle_distance(hands[0]),
                     timestamp_seconds,
                 )
+                interaction_event = interaction.update(
+                    pinch_ratio,
+                    right_ratio,
+                    timestamp_seconds,
+                )
+                pinch_event = interaction_event
                 scroll_event = scroll.update(
                     hands[0],
                     timestamp_seconds,
                     pinch_active=(
-                        pinch.pressed
-                        or pinch_event.pressed
-                        or pinch_event.released
+                        interaction.mode is not None
                     ),
                 )
 
@@ -366,7 +467,7 @@ def main() -> None:
                 history.add(raw_position, timestamp_seconds)
                 is_still = stillness.update(anchor)
 
-                if pinch_event.pressed:
+                if interaction_event.left_pressed:
                     freeze_frames = GESTURE_THRESHOLDS.pinch_freeze_frames
                     press_position = history.latch(
                         timestamp_seconds,
@@ -375,15 +476,34 @@ def main() -> None:
                     output.set_enabled(True)
                     output.set_dragging(False)
                     output.set_target(press_position)
-                    controller.mouse_down(*press_position)
-                elif pinch_event.released:
+                elif interaction_event.right_pressed:
+                    press_position = history.latch(
+                        timestamp_seconds,
+                        GESTURE_THRESHOLDS.latch_ms,
+                    ) or cursor_position
+                elif interaction_event.left_released:
                     output.set_dragging(False)
-                    controller.mouse_up(*press_position)
+                    if interaction_event.drag_ended:
+                        controller.mouse_up(*press_position)
+                        event_log.add(timestamp_seconds, "DRAG END")
+                    elif interaction_event.left_clicked:
+                        event_log.add(timestamp_seconds, "CLICK")
+                        if args.live:
+                            controller.move_mouse(*press_position)
+                            # Send down/up together now that the gesture is confirmed quick.
+                            controller.mouse_down(*press_position)
+                            controller.mouse_up(*press_position)
+                elif interaction_event.right_clicked:
+                    event_log.add(timestamp_seconds, "RIGHT CLICK")
+                    controller.right_click(*press_position)
 
-                if pinch.pressed:
+                if interaction.mode == "left" and interaction_event.state == "DRAGGING":
+                    if interaction_event.drag_started:
+                        event_log.add(timestamp_seconds, "DRAG START")
+                        controller.mouse_down(*press_position)
                     if freeze_frames > 0:
                         freeze_frames -= 1
-                    elif pinch_event.dragging:
+                    else:
                         cursor_x = x_filter(raw_position[0], timestamp_seconds)
                         cursor_y = y_filter(raw_position[1], timestamp_seconds)
                         cursor_position = (cursor_x, cursor_y)
@@ -391,8 +511,13 @@ def main() -> None:
                         output.set_dragging(True)
                 elif scroll_event.active:
                     output.set_enabled(False)
-                    if scroll_event.delta:
-                        controller.scroll(scroll_event.delta)
+                    if scroll_event.sent_amount:
+                        controller.scroll(
+                            scroll_event.sent_amount,
+                            cursor_position[0],
+                            cursor_position[1],
+                        )
+                        event_log.add(timestamp_seconds, "SCROLL")
                     if not args.live:
                         cv2.putText(
                             frame,
@@ -414,25 +539,26 @@ def main() -> None:
                     output.set_enabled(True)
                     output.set_target(cursor_position)
 
-                if not args.live and pinch.pressed:
-                    state = "PINCH" if pinch.pressed else "READY"
+                if not args.live:
+                    state = interaction_event.state
                     cv2.putText(
                         frame,
                         state,
                         (10, 65),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         1,
-                        (0, 0, 255) if pinch.pressed else (0, 255, 0),
+                        (0, 0, 255) if state in ("PINCHING", "DRAGGING") else (0, 255, 0),
                         2,
                     )
-            elif pinch.pressed:
+            else:
                 previous_anchor = None
                 previous_pointer_time = None
-                pinch_event = pinch.update(float("inf"), timestamp_ms / 1000.0)
-                scroll.update(None, timestamp_ms / 1000.0, pinch_active=True)
-                if pinch_event.released:
+                interaction_event = interaction.reset()
+                scroll_event = scroll.update(None, timestamp_ms / 1000.0)
+                if interaction_event.drag_ended:
                     output.set_dragging(False)
                     controller.mouse_up(*press_position)
+                    event_log.add(timestamp_ms / 1000.0, "DRAG END")
                 if not args.live:
                     cv2.putText(
                         frame,
@@ -441,20 +567,6 @@ def main() -> None:
                         cv2.FONT_HERSHEY_SIMPLEX,
                         1,
                         (0, 165, 255),
-                        2,
-                    )
-            else:
-                previous_anchor = None
-                previous_pointer_time = None
-                scroll_event = scroll.update(None, timestamp_ms / 1000.0)
-                if not args.live and scroll_event.ended:
-                    cv2.putText(
-                        frame,
-                        "READY",
-                        (10, 65),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (0, 255, 0),
                         2,
                     )
 
@@ -486,8 +598,10 @@ def main() -> None:
                     fps,
                     (time.perf_counter() - frame_started) * 1000.0,
                     GESTURE_THRESHOLDS.output_rate_hz if args.live else 0.0,
+                    scroll_event,
                 )
 
+            event_log.draw(frame)
             cv2.imshow("saigai", frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):

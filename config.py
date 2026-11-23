@@ -10,6 +10,13 @@ class GestureThresholds:
     pinch_freeze_frames: int = 3
     pinch_min_cutoff: float = 2.0
     pinch_beta: float = 0.02
+    drag_hold_ms: float = 250.0
+    click_flash_ms: float = 400.0
+    right_press_threshold: float = 0.48
+    right_release_threshold: float = 0.63
+    right_click_max_duration: float = 0.30
+    finger_extension_threshold: float = 1.15
+    scroll_remainder: bool = True
     scroll_sensitivity: float = 1200.0
     scroll_dead_zone: float = 0.002
     scroll_invert: bool = False
