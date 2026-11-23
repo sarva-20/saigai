@@ -34,6 +34,21 @@ def normalized_pinch_distance(landmarks: Sequence[Sequence[float]]) -> float:
     return landmark_distance(landmarks[4], landmarks[8]) / hand_size
 
 
+def is_scroll_pose(
+    landmarks: Sequence[Sequence[float]],
+    pinch_active: bool = False,
+) -> bool:
+    """Return whether index/middle are extended and ring/pinky are curled."""
+    if len(landmarks) <= 20 or pinch_active:
+        return False
+
+    index_extended = landmarks[8][1] < landmarks[6][1]
+    middle_extended = landmarks[12][1] < landmarks[10][1]
+    ring_curled = landmarks[16][1] > landmarks[14][1]
+    pinky_curled = landmarks[20][1] > landmarks[18][1]
+    return index_extended and middle_extended and ring_curled and pinky_curled
+
+
 @dataclass(frozen=True)
 class PinchEvent:
     pressed: bool = False
@@ -77,6 +92,67 @@ class PinchStateMachine:
         self._press_time = None
         clicked = press_time is not None and timestamp - press_time < self.click_max_duration
         return PinchEvent(released=True, clicked=clicked)
+
+
+@dataclass(frozen=True)
+class ScrollEvent:
+    active: bool = False
+    started: bool = False
+    ended: bool = False
+    delta: float = 0.0
+
+
+class ScrollStateMachine:
+    def __init__(
+        self,
+        sensitivity: float,
+        dead_zone: float,
+        invert: bool = False,
+        min_cutoff: float = 1.0,
+        beta: float = 0.007,
+    ) -> None:
+        if sensitivity <= 0 or dead_zone < 0:
+            raise ValueError("sensitivity must be positive and dead_zone non-negative")
+        self.sensitivity = sensitivity
+        self.dead_zone = dead_zone
+        self.invert = invert
+        self._filter = OneEuroFilter(min_cutoff=min_cutoff, beta=beta)
+        self.active = False
+        self._previous_y: Optional[float] = None
+
+    def update(
+        self,
+        landmarks: Optional[Sequence[Sequence[float]]],
+        timestamp: float,
+        pinch_active: bool = False,
+    ) -> ScrollEvent:
+        pose_active = (
+            landmarks is not None
+            and is_scroll_pose(landmarks, pinch_active=pinch_active)
+        )
+        if not pose_active:
+            ended = self.active
+            self.active = False
+            self._previous_y = None
+            return ScrollEvent(ended=ended)
+
+        midpoint_y = (landmarks[8][1] + landmarks[12][1]) / 2.0
+        filtered_y = self._filter(midpoint_y, timestamp)
+        started = not self.active
+        self.active = True
+        if started:
+            self._previous_y = filtered_y
+            return ScrollEvent(active=True, started=True)
+
+        movement = filtered_y - self._previous_y
+        self._previous_y = filtered_y
+        if abs(movement) <= self.dead_zone:
+            return ScrollEvent(active=True)
+
+        delta = -movement * self.sensitivity
+        if self.invert:
+            delta = -delta
+        return ScrollEvent(active=True, delta=delta)
 
 
 def map_index_finger_to_screen(

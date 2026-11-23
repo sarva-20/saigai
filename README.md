@@ -27,3 +27,6 @@ Without `--live`, saigai draws a preview dot where the cursor would move. Pass
 movement. Pinch and release performs a left click; holding the pinch while
 moving performs a left-button drag. Clicking and dragging are only enabled with
 `--live`.
+
+With two fingers extended and the ring and pinky curled, vertical movement
+scrolls instead of moving the cursor. Scroll events are also live-only.

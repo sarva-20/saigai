@@ -8,6 +8,7 @@ from config import GESTURE_THRESHOLDS
 from gestures import (
     OneEuroFilter,
     PinchStateMachine,
+    ScrollStateMachine,
     map_index_finger_to_screen,
     normalized_pinch_distance,
 )
@@ -51,6 +52,13 @@ def main() -> None:
         release_threshold=GESTURE_THRESHOLDS.pinch_release_threshold,
         click_max_duration=GESTURE_THRESHOLDS.click_max_duration,
     )
+    scroll = ScrollStateMachine(
+        sensitivity=GESTURE_THRESHOLDS.scroll_sensitivity,
+        dead_zone=GESTURE_THRESHOLDS.scroll_dead_zone,
+        invert=GESTURE_THRESHOLDS.scroll_invert,
+        min_cutoff=GESTURE_THRESHOLDS.scroll_min_cutoff,
+        beta=GESTURE_THRESHOLDS.scroll_beta,
+    )
     freeze_frames = 0
     cursor_position = (screen_width / 2, screen_height / 2)
     previous_time = time.perf_counter()
@@ -82,6 +90,15 @@ def main() -> None:
                     normalized_pinch_distance(hands[0]),
                     timestamp_seconds,
                 )
+                scroll_event = scroll.update(
+                    hands[0],
+                    timestamp_seconds,
+                    pinch_active=(
+                        pinch.pressed
+                        or pinch_event.pressed
+                        or pinch_event.released
+                    ),
+                )
 
                 if pinch_event.pressed:
                     freeze_frames = GESTURE_THRESHOLDS.pinch_freeze_frames
@@ -89,20 +106,36 @@ def main() -> None:
                 elif pinch_event.released:
                     controller.mouse_up(*cursor_position)
 
-                if freeze_frames > 0:
+                if pinch.pressed:
+                    if freeze_frames > 0:
+                        freeze_frames -= 1
+                    elif pinch_event.dragging:
+                        cursor_x = x_filter(target_x, timestamp_seconds)
+                        cursor_y = y_filter(target_y, timestamp_seconds)
+                        cursor_position = (cursor_x, cursor_y)
+                        controller.mouse_dragged(cursor_x, cursor_y)
+                elif scroll_event.active:
+                    if scroll_event.delta:
+                        controller.scroll(scroll_event.delta)
+                    if not args.live:
+                        cv2.putText(
+                            frame,
+                            f"SCROLL {scroll_event.delta:+.1f}",
+                            (10, 65),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1,
+                            (255, 0, 0),
+                            2,
+                        )
+                elif freeze_frames > 0:
                     freeze_frames -= 1
-                elif not pinch.pressed:
+                else:
                     cursor_x = x_filter(target_x, timestamp_seconds)
                     cursor_y = y_filter(target_y, timestamp_seconds)
                     cursor_position = (cursor_x, cursor_y)
                     controller.move_mouse(cursor_x, cursor_y)
-                elif pinch_event.dragging:
-                    cursor_x = x_filter(target_x, timestamp_seconds)
-                    cursor_y = y_filter(target_y, timestamp_seconds)
-                    cursor_position = (cursor_x, cursor_y)
-                    controller.mouse_dragged(cursor_x, cursor_y)
 
-                if not args.live:
+                if not args.live and pinch.pressed:
                     state = "PINCH" if pinch.pressed else "READY"
                     cv2.putText(
                         frame,
@@ -115,6 +148,7 @@ def main() -> None:
                     )
             elif pinch.pressed:
                 pinch_event = pinch.update(float("inf"), timestamp_ms / 1000.0)
+                scroll.update(None, timestamp_ms / 1000.0, pinch_active=True)
                 if pinch_event.released:
                     controller.mouse_up(*cursor_position)
                 if not args.live:
@@ -125,6 +159,18 @@ def main() -> None:
                         cv2.FONT_HERSHEY_SIMPLEX,
                         1,
                         (0, 165, 255),
+                        2,
+                    )
+            else:
+                scroll_event = scroll.update(None, timestamp_ms / 1000.0)
+                if not args.live and scroll_event.ended:
+                    cv2.putText(
+                        frame,
+                        "READY",
+                        (10, 65),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1,
+                        (0, 255, 0),
                         2,
                     )
 

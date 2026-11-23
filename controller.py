@@ -84,3 +84,21 @@ class Controller:
         except ImportError as exc:
             raise RuntimeError("Quartz mouse control requires macOS") from exc
         return self._mouse_event(Quartz.kCGEventLeftMouseUp, x, y)
+
+    def scroll(self, delta: float) -> bool:
+        if not self.live:
+            return False
+
+        try:
+            import Quartz
+
+            event = Quartz.CGEventCreateScrollWheelEvent(
+                None,
+                Quartz.kCGScrollEventUnitPixel,
+                1,
+                int(round(delta)),
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+            return True
+        except ImportError as exc:
+            raise RuntimeError("Quartz scroll control requires macOS") from exc
