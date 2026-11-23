@@ -88,7 +88,28 @@ class Controller:
             raise RuntimeError("Quartz mouse control requires macOS") from exc
         return self._mouse_event(Quartz.kCGEventLeftMouseUp, x, y)
 
-    def scroll(self, delta: float) -> bool:
+    def right_click(self, x: float, y: float) -> bool:
+        try:
+            import Quartz
+        except ImportError as exc:
+            raise RuntimeError("Quartz mouse control requires macOS") from exc
+        if not self.live:
+            return False
+        for event_type in (
+            Quartz.kCGEventRightMouseDown,
+            Quartz.kCGEventRightMouseUp,
+        ):
+            point = Quartz.CGPoint(x=x, y=y)
+            event = Quartz.CGEventCreateMouseEvent(
+                None,
+                event_type,
+                point,
+                Quartz.kCGMouseButtonRight,
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        return True
+
+    def scroll(self, delta: float, x: Optional[float] = None, y: Optional[float] = None) -> bool:
         if not self.live:
             return False
 
@@ -101,6 +122,14 @@ class Controller:
                 1,
                 int(round(delta)),
             )
+            if hasattr(Quartz, "CGEventSetLocation"):
+                Quartz.CGEventSetLocation(
+                    event,
+                    Quartz.CGPoint(
+                        x=float(x if x is not None else 0),
+                        y=float(y if y is not None else 0),
+                    ),
+                )
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
             return True
         except ImportError as exc:

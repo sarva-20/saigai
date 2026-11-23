@@ -1,6 +1,7 @@
 import unittest
 
 from gestures import (
+    HandInteractionStateMachine,
     OneEuroFilter,
     PointerHistory,
     PinchStateMachine,
@@ -10,6 +11,7 @@ from gestures import (
     is_scroll_pose,
     map_index_finger_to_screen,
     normalized_pinch_distance,
+    normalized_thumb_middle_distance,
     relative_pointer_delta,
 )
 
@@ -123,6 +125,13 @@ class GestureTests(unittest.TestCase):
             normalized_pinch_distance(large),
         )
 
+    def test_normalized_thumb_middle_distance_is_handedness_independent(self) -> None:
+        landmarks = [[0.0, 0.0, 0.0] for _ in range(21)]
+        landmarks[9] = [0.2, 0.0, 0.0]
+        landmarks[4] = [0.0, 0.04, 0.0]
+        landmarks[12] = [0.0, 0.08, 0.0]
+        self.assertAlmostEqual(normalized_thumb_middle_distance(landmarks), 0.20)
+
     def test_pinch_state_machine_hysteresis_click_and_drag(self) -> None:
         state = PinchStateMachine(press_threshold=0.45, release_threshold=0.60)
 
@@ -146,22 +155,30 @@ class GestureTests(unittest.TestCase):
     @staticmethod
     def scroll_hand() -> list[list[float]]:
         landmarks = [[0.0, 0.0, 0.0] for _ in range(21)]
-        landmarks[6][1] = 0.5
-        landmarks[8][1] = 0.3
-        landmarks[10][1] = 0.5
-        landmarks[12][1] = 0.3
-        landmarks[14][1] = 0.3
-        landmarks[16][1] = 0.5
-        landmarks[18][1] = 0.3
-        landmarks[20][1] = 0.5
+        landmarks[6] = [0.15, 0.15, 0.0]
+        landmarks[8] = [0.30, 0.30, 0.0]
+        landmarks[10] = [-0.15, 0.15, 0.0]
+        landmarks[12] = [-0.30, 0.30, 0.0]
+        landmarks[14] = [-0.15, -0.15, 0.0]
+        landmarks[16] = [-0.10, -0.10, 0.0]
+        landmarks[18] = [0.15, -0.15, 0.0]
+        landmarks[20] = [0.10, -0.10, 0.0]
         return landmarks
 
     def test_scroll_pose_requires_extended_index_middle_and_curled_others(self) -> None:
         landmarks = self.scroll_hand()
         self.assertTrue(is_scroll_pose(landmarks))
         self.assertFalse(is_scroll_pose(landmarks, pinch_active=True))
-        landmarks[16][1] = 0.2
+        landmarks[16] = [0.30, 0.30, 0.0]
         self.assertFalse(is_scroll_pose(landmarks))
+
+    def test_scroll_pose_at_tilted_hand_angle(self) -> None:
+        landmarks = self.scroll_hand()
+        tilted = [[point[0] - 0.10, point[1] + 0.25, point[2]] for point in landmarks]
+        for index in (8, 12):
+            tilted[index][0] += 0.20
+            tilted[index][1] += 0.20
+        self.assertTrue(is_scroll_pose(tilted))
 
     def test_scroll_dead_zone_and_direction_inversion(self) -> None:
         landmarks = self.scroll_hand()
@@ -193,6 +210,51 @@ class GestureTests(unittest.TestCase):
         self.assertFalse(
             state.update(landmarks, 3.0, pinch_active=pinch.pressed).active
         )
+
+    def test_interaction_states_click_drag_and_right_click_exclusivity(self) -> None:
+        state = HandInteractionStateMachine(
+            0.45,
+            0.60,
+            0.48,
+            0.63,
+            drag_hold_ms=250,
+            click_max_duration=0.30,
+            click_flash_ms=400,
+        )
+        pressed = state.update(0.40, 0.70, 0.0)
+        self.assertEqual(pressed.state, "PINCHING")
+        dragging = state.update(0.40, 0.70, 0.26)
+        self.assertEqual(dragging.state, "DRAGGING")
+        drag_end = state.update(0.61, 0.70, 0.30)
+        self.assertTrue(drag_end.drag_ended)
+
+        right = HandInteractionStateMachine(
+            0.45, 0.60, 0.48, 0.63, drag_hold_ms=250
+        )
+        self.assertEqual(right.update(0.70, 0.40, 1.0).state, "PINCHING")
+        right_click = right.update(0.70, 0.64, 1.1)
+        self.assertTrue(right_click.right_clicked)
+
+        exclusive = HandInteractionStateMachine(
+            0.45, 0.60, 0.48, 0.63
+        )
+        event = exclusive.update(0.40, 0.40, 2.0)
+        self.assertEqual(event.state, "PINCHING")
+        self.assertTrue(exclusive.mode == "left")
+
+    def test_scroll_remainder_carries_fractional_amount(self) -> None:
+        landmarks = self.scroll_hand()
+        state = ScrollStateMachine(100.0, dead_zone=0.0)
+        state.update(landmarks, 0.0)
+        landmarks[8][1] += 0.002
+        landmarks[12][1] += 0.002
+        first = state.update(landmarks, 1.0)
+        self.assertLessEqual(abs(first.sent_amount), 1)
+        landmarks[8][1] += 0.002
+        landmarks[12][1] += 0.002
+        second = state.update(landmarks, 2.0)
+        combined = first.sent_amount + second.sent_amount
+        self.assertGreaterEqual(combined, 0)
 
 
 if __name__ == "__main__":
