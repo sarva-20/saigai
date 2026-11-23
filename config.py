@@ -21,6 +21,16 @@ class GestureThresholds:
     pointer_gain: float = 1.0
     pointer_acceleration: float = 0.35
     pointer_speed_reference: float = 0.8
+    invert_x: bool = False
+    invert_y: bool = False
+    output_rate_hz: float = 120.0
+    output_smoothing_time_constant: float = 0.08
+    stillness_threshold: float = 0.004
+    pointer_history_size: int = 32
+    latch_ms: float = 120.0
+    calibration_file: str = "calibration.json"
+    calibration_countdown_seconds: float = 3.0
+    calibration_sample_seconds: float = 1.0
     camera_width: int = 1280
     camera_height: int = 720
     camera_fps: int = 30
