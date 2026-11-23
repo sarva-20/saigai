@@ -4,6 +4,7 @@ from gestures import (
     HandInteractionStateMachine,
     OneEuroFilter,
     PointerHistory,
+    RatioMedianFilter,
     PinchStateMachine,
     ScrollStateMachine,
     StillnessLock,
@@ -13,6 +14,7 @@ from gestures import (
     normalized_pinch_distance,
     normalized_thumb_middle_distance,
     relative_pointer_delta,
+    calibrated_pinch_thresholds,
 )
 
 
@@ -255,6 +257,51 @@ class GestureTests(unittest.TestCase):
         second = state.update(landmarks, 2.0)
         combined = first.sent_amount + second.sent_amount
         self.assertGreaterEqual(combined, 0)
+
+    def test_calibration_threshold_math(self) -> None:
+        press, release = calibrated_pinch_thresholds(1.0, 0.2)
+        self.assertAlmostEqual(press, 0.48)
+        self.assertAlmostEqual(release, 0.64)
+
+    def test_median_filter_uses_last_three_ratios(self) -> None:
+        median_filter = RatioMedianFilter(3)
+        self.assertEqual(median_filter.update(0.8), 0.8)
+        self.assertEqual(median_filter.update(0.2), 0.5)
+        self.assertEqual(median_filter.update(0.4), 0.4)
+        self.assertEqual(median_filter.update(0.1), 0.2)
+
+    def test_minimum_pinch_duration_guard(self) -> None:
+        state = HandInteractionStateMachine(
+            0.45, 0.60, 0.48, 0.63,
+            drag_hold_ms=400,
+            click_max_duration=0.350,
+            min_pinch_ms=40,
+        )
+        self.assertTrue(state.update(0.40, 0.70, 1.0).left_pressed)
+        ignored = state.update(0.61, 0.70, 1.039)
+        self.assertEqual(ignored.state, "READY")
+        self.assertFalse(ignored.left_clicked)
+
+    def test_click_and_drag_boundaries(self) -> None:
+        click_state = HandInteractionStateMachine(
+            0.45, 0.60, 0.48, 0.63,
+            drag_hold_ms=400,
+            click_max_duration=0.350,
+            min_pinch_ms=40,
+        )
+        click_state.update(0.40, 0.70, 0.0)
+        under = click_state.update(0.61, 0.70, 0.349)
+        self.assertTrue(under.left_clicked)
+
+        at_drag = HandInteractionStateMachine(
+            0.45, 0.60, 0.48, 0.63,
+            drag_hold_ms=400,
+            click_max_duration=0.350,
+            min_pinch_ms=40,
+        )
+        at_drag.update(0.40, 0.70, 0.0)
+        at_boundary = at_drag.update(0.40, 0.70, 0.400)
+        self.assertTrue(at_boundary.drag_started)
 
 
 if __name__ == "__main__":

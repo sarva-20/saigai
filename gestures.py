@@ -2,6 +2,7 @@
 
 from math import pi
 from math import dist
+from statistics import median
 from dataclasses import dataclass
 from collections import deque
 from time import monotonic
@@ -26,11 +27,13 @@ def is_pinching(
 
 
 def normalized_pinch_distance(landmarks: Sequence[Sequence[float]]) -> float:
-    """Return thumb-index distance normalized by wrist-to-middle-MCP size."""
-    if len(landmarks) <= 9:
-        raise ValueError("hand landmarks must include landmarks 0, 4, 8, and 9")
+    """Normalize thumb-index distance by the larger stable palm dimension."""
+    if len(landmarks) <= 17:
+        raise ValueError("hand landmarks must include palm landmarks")
 
-    hand_size = landmark_distance(landmarks[0], landmarks[9])
+    palm_length = landmark_distance(landmarks[0], landmarks[9])
+    palm_width = landmark_distance(landmarks[5], landmarks[17])
+    hand_size = max(palm_length, palm_width)
     if hand_size <= 0:
         raise ValueError("hand size must be positive")
     return landmark_distance(landmarks[4], landmarks[8]) / hand_size
@@ -39,12 +42,38 @@ def normalized_pinch_distance(landmarks: Sequence[Sequence[float]]) -> float:
 def normalized_thumb_middle_distance(
     landmarks: Sequence[Sequence[float]],
 ) -> float:
-    if len(landmarks) <= 12:
-        raise ValueError("hand landmarks must include thumb tip and middle tip")
-    hand_size = landmark_distance(landmarks[0], landmarks[9])
+    if len(landmarks) <= 17:
+        raise ValueError("hand landmarks must include palm landmarks")
+    palm_length = landmark_distance(landmarks[0], landmarks[9])
+    palm_width = landmark_distance(landmarks[5], landmarks[17])
+    hand_size = max(palm_length, palm_width)
     if hand_size <= 0:
         raise ValueError("hand size must be positive")
     return landmark_distance(landmarks[4], landmarks[12]) / hand_size
+
+
+class RatioMedianFilter:
+    def __init__(self, size: int = 3) -> None:
+        if size <= 0:
+            raise ValueError("median filter size must be positive")
+        self._values: deque[float] = deque(maxlen=size)
+
+    def update(self, value: float) -> float:
+        self._values.append(float(value))
+        return float(median(self._values))
+
+
+def calibrated_pinch_thresholds(
+    open_ratio: float,
+    pinched_ratio: float,
+) -> tuple[float, float]:
+    """Map a pinch between open/pinch samples at 35% and 55% of the range."""
+    span = open_ratio - pinched_ratio
+    if span <= 0:
+        raise ValueError("open pinch ratio must exceed pinched ratio")
+    press = pinched_ratio + 0.35 * span
+    release = pinched_ratio + 0.55 * span
+    return press, release
 
 
 def is_scroll_pose(
@@ -267,6 +296,7 @@ class HandInteractionStateMachine:
         drag_hold_ms: float = 250.0,
         click_max_duration: float = 0.30,
         click_flash_ms: float = 400.0,
+        min_pinch_ms: float = 40.0,
     ) -> None:
         self.left_press = left_press
         self.left_release = left_release
@@ -275,10 +305,12 @@ class HandInteractionStateMachine:
         self.drag_hold_ms = drag_hold_ms
         self.click_max_duration = click_max_duration
         self.click_flash_ms = click_flash_ms
+        self.min_pinch_ms = min_pinch_ms
         self.mode: Optional[str] = None
         self.state = "READY"
         self._press_time: Optional[float] = None
         self._click_flash_end: Optional[float] = None
+        self.press_releases: deque[tuple[float, float]] = deque(maxlen=16)
 
     def reset(self) -> InteractionEvent:
         was_dragging = self.mode == "left" and self.state == "DRAGGING"
@@ -338,11 +370,18 @@ class HandInteractionStateMachine:
         if self.mode == "left":
             if left_ratio >= self.left_release:
                 held_ms = elapsed_ms
-                quick_click = held_ms <= self.drag_hold_ms
-                was_dragging = held_ms > self.drag_hold_ms
+                if held_ms < self.min_pinch_ms:
+                    self.mode = None
+                    self._press_time = None
+                    self.state = "READY"
+                    self.press_releases.append((held_ms, 0.0))
+                    return InteractionEvent(state="READY")
+                quick_click = held_ms < self.click_max_duration * 1000.0
+                was_dragging = held_ms >= self.drag_hold_ms
                 self.mode = None
                 self._press_time = None
                 self.state = "CLICK" if quick_click else "READY"
+                self.press_releases.append((held_ms, 0.0))
                 if quick_click:
                     self._click_flash_end = timestamp + self.click_flash_ms / 1000.0
                 return InteractionEvent(
@@ -361,6 +400,12 @@ class HandInteractionStateMachine:
 
         if right_ratio >= self.right_release:
             held_ms = elapsed_ms
+            if held_ms < self.min_pinch_ms:
+                self.mode = None
+                self._press_time = None
+                self.state = "READY"
+                self.press_releases.append((held_ms, 0.0))
+                return InteractionEvent(state="READY")
             quick_click = held_ms <= self.click_max_duration * 1000.0
             self.mode = None
             self._press_time = None

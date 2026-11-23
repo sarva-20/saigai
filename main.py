@@ -3,6 +3,7 @@ import json
 import time
 from collections import deque
 from pathlib import Path
+from statistics import median
 from typing import Optional, Tuple
 
 import cv2
@@ -14,6 +15,8 @@ from gestures import (
     OneEuroFilter,
     HandInteractionStateMachine,
     PointerHistory,
+    RatioMedianFilter,
+    calibrated_pinch_thresholds,
     ScrollStateMachine,
     StillnessLock,
     finger_extension_states,
@@ -72,6 +75,23 @@ def load_calibration(path: Path) -> Optional[Tuple[float, float, float, float]]:
     with path.open() as calibration_file:
         values = json.load(calibration_file)
     return tuple(values[key] for key in ("left", "top", "right", "bottom"))
+
+
+def load_pinch_calibration(path: Path) -> dict[str, float]:
+    if not path.exists():
+        return {}
+    with path.open() as calibration_file:
+        values = json.load(calibration_file)
+    return {
+        key: float(value)
+        for key, value in values.items()
+        if key in (
+            "left_press",
+            "left_release",
+            "right_press",
+            "right_release",
+        )
+    }
 
 
 def calibrate(
@@ -150,6 +170,65 @@ def calibrate(
         json.dump({"left": left, "top": top, "right": right, "bottom": bottom}, calibration_file)
 
 
+def calibrate_pinch(camera: cv2.VideoCapture, tracker: HandTracker, path: Path) -> None:
+    poses = (
+        "Hold hand open (relaxed)",
+        "Pinch and hold",
+        "Hold hand open (relaxed)",
+        "Pinch and hold",
+    )
+    left_samples: dict[str, list[float]] = {"open": [], "pinched": []}
+    right_samples: dict[str, list[float]] = {"open": [], "pinched": []}
+
+    for index, prompt in enumerate(poses):
+        pose = "pinched" if "Pinch" in prompt else "open"
+        start = time.perf_counter()
+        while time.perf_counter() - start < 2.0:
+            success, frame = read_latest_frame(camera)
+            if not success or frame is None:
+                continue
+            frame = cv2.flip(frame, 1)
+            hands = tracker.process(frame, int(time.perf_counter() * 1000))
+            draw_landmarks(frame, hands)
+            if hands:
+                left_samples[pose].append(normalized_pinch_distance(hands[0]))
+                right_samples[pose].append(normalized_thumb_middle_distance(hands[0]))
+            cv2.putText(
+                frame,
+                prompt,
+                (30, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 255),
+                2,
+            )
+            cv2.imshow("saigai pinch calibration", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                raise KeyboardInterrupt
+
+    left_open = median(left_samples["open"])
+    left_pinched = median(left_samples["pinched"])
+    right_open = median(right_samples["open"])
+    right_pinched = median(right_samples["pinched"])
+    left_press, left_release = calibrated_pinch_thresholds(left_open, left_pinched)
+    right_press, right_release = calibrated_pinch_thresholds(right_open, right_pinched)
+
+    values = {}
+    if path.exists():
+        with path.open() as calibration_file:
+            values = json.load(calibration_file)
+    values.update(
+        {
+            "left_press": left_press,
+            "left_release": left_release,
+            "right_press": right_press,
+            "right_release": right_release,
+        }
+    )
+    with path.open("w") as calibration_file:
+        json.dump(values, calibration_file)
+
+
 def draw_debug_overlay(
     frame: np.ndarray,
     raw_position: Optional[Tuple[float, float]],
@@ -163,6 +242,8 @@ def draw_debug_overlay(
     latency_ms: float,
     output_rate_hz: float,
     scroll_event=None,
+    pinch_history=None,
+    pinch_events=None,
 ) -> None:
     height, width = frame.shape[:2]
 
@@ -228,6 +309,45 @@ def draw_debug_overlay(
         (255, 255, 255),
         1,
     )
+
+    if pinch_history:
+        graph_x, graph_y, graph_width, graph_height = 260, 95, 300, 90
+        cv2.rectangle(
+            frame,
+            (graph_x, graph_y),
+            (graph_x + graph_width, graph_y + graph_height),
+            (180, 180, 180),
+            1,
+        )
+        scale = max(release_threshold * 1.5, 1.0)
+        points = []
+        values = list(pinch_history)
+        for index, (_, ratio) in enumerate(values):
+            x = graph_x + int(index * graph_width / max(len(values) - 1, 1))
+            y = graph_y + graph_height - int(min(ratio / scale, 1.0) * graph_height)
+            points.append((x, y))
+        if len(points) > 1:
+            cv2.polylines(frame, [points], False, (255, 255, 255), 2)
+        for threshold, color in (
+            (press_threshold, (0, 0, 255)),
+            (release_threshold, (0, 255, 255)),
+        ):
+            y = graph_y + graph_height - int(min(threshold / scale, 1.0) * graph_height)
+            cv2.line(frame, (graph_x, y), (graph_x + graph_width, y), color, 1)
+        if pinch_events:
+            for event_index, (timestamp, label, duration) in enumerate(pinch_events):
+                cv2.putText(
+                    frame,
+                    f"{label} {duration:.0f} ms",
+                    (
+                        graph_x,
+                        graph_y + graph_height + 14 + event_index * 14,
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 255, 255),
+                    1,
+                )
 
     if scroll_event is not None:
         fingers = scroll_event.finger_states or {}
@@ -297,6 +417,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="post alternating down/up scroll events for 5 seconds without a camera",
     )
+    parser.add_argument(
+        "--calibrate-pinch",
+        action="store_true",
+        help="calibrate left and right pinch thresholds",
+    )
     return parser.parse_args()
 
 
@@ -330,7 +455,16 @@ def main() -> None:
             tracker.close()
             cv2.destroyAllWindows()
         return
+    if args.calibrate_pinch:
+        try:
+            calibrate_pinch(camera, tracker, calibration_path)
+        finally:
+            camera.release()
+            tracker.close()
+            cv2.destroyAllWindows()
+        return
     active_region = load_calibration(calibration_path)
+    pinch_calibration = load_pinch_calibration(calibration_path)
     x_filter = OneEuroFilter(
         min_cutoff=GESTURE_THRESHOLDS.one_euro_min_cutoff,
         beta=GESTURE_THRESHOLDS.one_euro_beta,
@@ -347,14 +481,25 @@ def main() -> None:
         min_cutoff=GESTURE_THRESHOLDS.pinch_min_cutoff,
         beta=GESTURE_THRESHOLDS.pinch_beta,
     )
+    left_ratio_median = RatioMedianFilter(3)
+    right_ratio_median = RatioMedianFilter(3)
     interaction = HandInteractionStateMachine(
-        left_press=GESTURE_THRESHOLDS.pinch_press_threshold,
-        left_release=GESTURE_THRESHOLDS.pinch_release_threshold,
-        right_press=GESTURE_THRESHOLDS.right_press_threshold,
-        right_release=GESTURE_THRESHOLDS.right_release_threshold,
+        left_press=pinch_calibration.get(
+            "left_press", GESTURE_THRESHOLDS.pinch_press_threshold
+        ),
+        left_release=pinch_calibration.get(
+            "left_release", GESTURE_THRESHOLDS.pinch_release_threshold
+        ),
+        right_press=pinch_calibration.get(
+            "right_press", GESTURE_THRESHOLDS.right_press_threshold
+        ),
+        right_release=pinch_calibration.get(
+            "right_release", GESTURE_THRESHOLDS.right_release_threshold
+        ),
         drag_hold_ms=GESTURE_THRESHOLDS.drag_hold_ms,
         click_max_duration=GESTURE_THRESHOLDS.click_max_duration,
         click_flash_ms=GESTURE_THRESHOLDS.click_flash_ms,
+        min_pinch_ms=GESTURE_THRESHOLDS.min_pinch_ms,
     )
     scroll = ScrollStateMachine(
         sensitivity=GESTURE_THRESHOLDS.scroll_sensitivity,
@@ -385,6 +530,9 @@ def main() -> None:
     scroll_event = None
     pinch_ratio = None
     raw_position = None
+    pinch_history: deque[tuple[float, float]] = deque(maxlen=90)
+    pinch_events: deque[tuple[float, str, float]] = deque(maxlen=8)
+    pinch_press_timestamp: Optional[float] = None
 
     try:
         while True:
@@ -406,18 +554,34 @@ def main() -> None:
                 )
                 timestamp_seconds = timestamp_ms / 1000.0
                 pinch_ratio = pinch_filter(
-                    normalized_pinch_distance(hands[0]),
+                    left_ratio_median.update(normalized_pinch_distance(hands[0])),
                     timestamp_seconds,
                 )
                 right_ratio = right_filter(
-                    normalized_thumb_middle_distance(hands[0]),
+                    right_ratio_median.update(normalized_thumb_middle_distance(hands[0])),
                     timestamp_seconds,
                 )
+                pinch_history.append((timestamp_seconds, pinch_ratio))
                 interaction_event = interaction.update(
                     pinch_ratio,
                     right_ratio,
                     timestamp_seconds,
                 )
+                if interaction_event.left_pressed or interaction_event.right_pressed:
+                    pinch_press_timestamp = timestamp_seconds
+                    pinch_events.append(
+                        (timestamp_seconds, "PRESS", 0.0)
+                    )
+                if interaction_event.left_released or interaction_event.right_clicked:
+                    duration = (
+                        (timestamp_seconds - pinch_press_timestamp) * 1000.0
+                        if pinch_press_timestamp is not None
+                        else 0.0
+                    )
+                    pinch_events.append(
+                        (timestamp_seconds, "RELEASE", duration)
+                    )
+                    pinch_press_timestamp = None
                 pinch_event = interaction_event
                 scroll_event = scroll.update(
                     hands[0],
@@ -599,6 +763,8 @@ def main() -> None:
                     (time.perf_counter() - frame_started) * 1000.0,
                     GESTURE_THRESHOLDS.output_rate_hz if args.live else 0.0,
                     scroll_event,
+                    pinch_history,
+                    pinch_events,
                 )
 
             event_log.draw(frame)

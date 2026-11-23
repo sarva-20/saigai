@@ -6,11 +6,12 @@ class GestureThresholds:
     pinch_distance: float = 0.05
     pinch_press_threshold: float = 0.45
     pinch_release_threshold: float = 0.60
-    click_max_duration: float = 0.30
+    click_max_duration: float = 0.350
     pinch_freeze_frames: int = 3
     pinch_min_cutoff: float = 2.0
     pinch_beta: float = 0.02
-    drag_hold_ms: float = 250.0
+    drag_hold_ms: float = 400.0
+    min_pinch_ms: float = 40.0
     click_flash_ms: float = 400.0
     right_press_threshold: float = 0.48
     right_release_threshold: float = 0.63

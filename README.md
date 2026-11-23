@@ -50,3 +50,7 @@ The preview and debug overlay show `READY`, `PINCHING`, `CLICK`, `DRAGGING`,
 
 Run `python main.py --selftest-scroll` to post down/up Quartz scroll events
 every 0.5 seconds for approximately 5 seconds without opening the camera.
+
+Run `python main.py --calibrate-pinch` to sample relaxed and pinched poses twice.
+The saved left/right press and release thresholds are loaded from
+`calibration.json` automatically.
