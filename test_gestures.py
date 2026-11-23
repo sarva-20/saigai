@@ -2,6 +2,8 @@ import unittest
 
 from gestures import (
     HandInteractionStateMachine,
+    ModeStateMachine,
+    PoseDebouncer,
     OneEuroFilter,
     PointerHistory,
     RatioMedianFilter,
@@ -15,6 +17,7 @@ from gestures import (
     normalized_thumb_middle_distance,
     relative_pointer_delta,
     calibrated_pinch_thresholds,
+    classify_hand_pose,
 )
 
 
@@ -226,9 +229,9 @@ class GestureTests(unittest.TestCase):
         pressed = state.update(0.40, 0.70, 0.0)
         self.assertEqual(pressed.state, "PINCHING")
         dragging = state.update(0.40, 0.70, 0.26)
-        self.assertEqual(dragging.state, "DRAGGING")
-        drag_end = state.update(0.61, 0.70, 0.30)
-        self.assertTrue(drag_end.drag_ended)
+        self.assertEqual(dragging.state, "PINCHING")
+        click_end = state.update(0.61, 0.70, 0.299)
+        self.assertTrue(click_end.left_clicked)
 
         right = HandInteractionStateMachine(
             0.45, 0.60, 0.48, 0.63, drag_hold_ms=250
@@ -301,7 +304,85 @@ class GestureTests(unittest.TestCase):
         )
         at_drag.update(0.40, 0.70, 0.0)
         at_boundary = at_drag.update(0.40, 0.70, 0.400)
-        self.assertTrue(at_boundary.drag_started)
+        self.assertEqual(at_boundary.state, "PINCHING")
+
+    @staticmethod
+    def pose_hand(count: int) -> list[list[float]]:
+        landmarks = [[0.0, 0.0, 0.0] for _ in range(21)]
+        wrists = (8, 12, 16, 20)
+        pips = (6, 10, 14, 18)
+        for finger, (tip, pip) in enumerate(zip(wrists, pips)):
+            landmarks[pip] = [0.2, 0.0, 0.0]
+            landmarks[tip] = [0.1, 0.0, 0.0]
+        for finger, (tip, pip) in enumerate(zip(wrists, pips)):
+            if finger < count:
+                landmarks[pip] = [0.1, 0.0, 0.0]
+                landmarks[tip] = [0.3, 0.0, 0.0]
+        landmarks[0] = [0.0, 0.0, 0.0]
+        return landmarks
+
+    def test_pose_classification_all_modes_and_tilt(self) -> None:
+        self.assertEqual(classify_hand_pose(self.pose_hand(1)), "POINT")
+        self.assertEqual(classify_hand_pose(self.pose_hand(2)), "SCROLL")
+        self.assertEqual(classify_hand_pose(self.pose_hand(3)), "THREE")
+        self.assertEqual(classify_hand_pose(self.pose_hand(4)), "FOUR")
+        open_hand = self.pose_hand(4)
+        open_hand[20] = [0.3, 0.0, 0.0]
+        open_hand[18] = [0.1, 0.0, 0.0]
+        open_hand[4] = [0.3, 0.0, 0.0]
+        open_hand[3] = [0.1, 0.0, 0.0]
+        self.assertEqual(classify_hand_pose(open_hand), "OPEN")
+        fist = self.pose_hand(0)
+        for tip in (8, 12, 16, 20):
+            fist[tip] = [0.05, 0.0, 0.0]
+        self.assertEqual(classify_hand_pose(fist), "FIST")
+
+    def test_pose_debounce_and_exit_hysteresis(self) -> None:
+        debounce = PoseDebouncer(stable_frames=5, exit_frames=3)
+        active = None
+        for _ in range(4):
+            active = debounce.update("POINT")
+        self.assertIsNone(active)
+        active = debounce.update("POINT")
+        self.assertEqual(active, "POINT")
+        self.assertEqual(debounce.update("SCROLL"), "POINT")
+        self.assertEqual(debounce.update("SCROLL"), "POINT")
+        self.assertIsNone(debounce.update("SCROLL"))
+
+    def test_three_finger_drag_lifecycle_and_hand_loss(self) -> None:
+        state = ModeStateMachine(clutch_hold_ms=700)
+        entered = state.update_pose("THREE", 1.0)
+        self.assertTrue(entered.drag_started)
+        self.assertEqual(entered.mode, "THREE")
+        ended = state.update_pose("POINT", 2.0)
+        self.assertTrue(ended.drag_ended)
+        state.update_pose("THREE", 3.0)
+        lost = state.hand_lost()
+        self.assertTrue(lost.drag_ended)
+        self.assertEqual(lost.pose, "NO HAND")
+
+    def test_mode_exclusivity_and_double_click(self) -> None:
+        state = ModeStateMachine(double_click_ms=400)
+        state.update_pose("POINT", 0.0)
+        self.assertEqual(state.mode, "POINT")
+        self.assertEqual(state.left_click(1.0), 1)
+        self.assertEqual(state.left_click(1.3), 2)
+        state.update_pose("SCROLL", 2.0)
+        self.assertEqual(state.mode, "SCROLL")
+
+    def test_clutch_toggle_timing(self) -> None:
+        state = ModeStateMachine(clutch_hold_ms=700)
+        state.update_pose("FIST", 0.0)
+        state.update_pose("FIST", 0.699)
+        self.assertFalse(state.paused)
+        toggled = state.update_pose("FIST", 0.700)
+        self.assertTrue(toggled.clutch_toggled)
+        self.assertTrue(state.paused)
+        state.update_pose("POINT", 1.0)
+        resumed = state.update_pose("FIST", 1.1)
+        resumed = state.update_pose("FIST", 1.800)
+        self.assertTrue(resumed.clutch_toggled)
+        self.assertFalse(state.paused)
 
 
 if __name__ == "__main__":

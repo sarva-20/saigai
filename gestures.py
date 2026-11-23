@@ -117,6 +117,194 @@ def finger_extension_states(
     return values
 
 
+def classify_hand_pose(
+    landmarks: Sequence[Sequence[float]],
+    extension_threshold: float = 1.15,
+) -> str:
+    if len(landmarks) <= 20:
+        return "UNKNOWN"
+    fingers = finger_extension_states(landmarks, extension_threshold)
+    count = sum(fingers.values())
+    thumb_extended = (
+        landmark_distance(landmarks[0], landmarks[4])
+        / landmark_distance(landmarks[0], landmarks[3])
+        >= extension_threshold
+        if landmark_distance(landmarks[0], landmarks[3]) > 0
+        else False
+    )
+    if count == 0:
+        return "FIST"
+    if count == 1 and fingers["index"]:
+        return "POINT"
+    if count == 2 and fingers["index"] and fingers["middle"]:
+        return "SCROLL"
+    if count == 3 and fingers["index"] and fingers["middle"] and fingers["ring"]:
+        return "THREE"
+    if count == 4 and thumb_extended:
+        return "OPEN"
+    if count == 4:
+        return "FOUR"
+    if count == 5:
+        return "OPEN"
+    return "UNKNOWN"
+
+
+class PoseDebouncer:
+    def __init__(self, stable_frames: int = 5, exit_frames: int = 3) -> None:
+        self.stable_frames = stable_frames
+        self.exit_frames = exit_frames
+        self.active: Optional[str] = None
+        self._candidate: Optional[str] = None
+        self._candidate_frames = 0
+        self._exit_frames = 0
+
+    def update(self, pose: str) -> Optional[str]:
+        if self.active is None:
+            if pose == self._candidate:
+                self._candidate_frames += 1
+            else:
+                self._candidate = pose
+                self._candidate_frames = 1
+            if self._candidate_frames >= self.stable_frames:
+                self.active = self._candidate
+                self._candidate = None
+                self._candidate_frames = 0
+            return self.active
+
+        if pose == self.active:
+            self._exit_frames = 0
+            return self.active
+        self._exit_frames += 1
+        if self._exit_frames >= self.exit_frames:
+            self.active = None
+            self._exit_frames = 0
+        return self.active
+
+
+@dataclass(frozen=True)
+class ModeEvent:
+    mode: str = "NONE"
+    pose: str = "UNKNOWN"
+    paused: bool = False
+    drag_started: bool = False
+    drag_ended: bool = False
+    clutch_toggled: bool = False
+
+
+class ModeStateMachine:
+    def __init__(
+        self,
+        clutch_hold_ms: float = 700.0,
+        double_click_ms: float = 400.0,
+    ) -> None:
+        self.clutch_hold_ms = clutch_hold_ms
+        self.double_click_ms = double_click_ms
+        self.mode = "NONE"
+        self.paused = False
+        self.dragging = False
+        self._fist_start: Optional[float] = None
+        self._fist_toggle_done = False
+        self._last_left_click: Optional[float] = None
+        self._double_ready = False
+
+    def update_pose(self, pose: Optional[str], timestamp: float) -> ModeEvent:
+        if pose == "FIST":
+            if self._fist_start is None:
+                self._fist_start = timestamp
+                self._fist_toggle_done = False
+            elif (
+                not self._fist_toggle_done
+                and (timestamp - self._fist_start) * 1000 >= self.clutch_hold_ms
+            ):
+                self._fist_toggle_done = True
+                self.paused = not self.paused
+                self._fist_start = None
+                if self.dragging:
+                    self.dragging = False
+                    return ModeEvent(
+                        mode="NONE",
+                        pose=pose,
+                        paused=self.paused,
+                        drag_ended=True,
+                        clutch_toggled=True,
+                    )
+                self.mode = "NONE"
+                return ModeEvent(
+                    mode="NONE",
+                    pose=pose,
+                    paused=self.paused,
+                    clutch_toggled=True,
+                )
+        else:
+            self._fist_start = None
+            self._fist_toggle_done = False
+
+        if self.paused:
+            return ModeEvent(mode="NONE", pose=pose or "NO HAND", paused=True)
+
+        if self.dragging and pose != "THREE":
+            self.dragging = False
+            self.mode = "NONE"
+            return ModeEvent(
+                mode="NONE",
+                pose=pose or "NO HAND",
+                drag_ended=True,
+            )
+
+        if pose == "POINT":
+            self.mode = "POINT"
+        elif pose == "SCROLL":
+            self.mode = "SCROLL"
+        elif pose == "THREE":
+            if not self.dragging:
+                self.dragging = True
+                self.mode = "THREE"
+                return ModeEvent(
+                    mode="THREE",
+                    pose="THREE",
+                    drag_started=True,
+                )
+            self.mode = "THREE"
+        else:
+            if self.dragging:
+                self.dragging = False
+                self.mode = "NONE"
+                return ModeEvent(
+                    mode="NONE",
+                    pose=pose or "NO HAND",
+                    drag_ended=True,
+                )
+            self.mode = "NONE"
+
+        return ModeEvent(mode=self.mode, pose=pose or "NO HAND")
+
+    def left_click(self, timestamp: float) -> int:
+        if self._last_left_click is None:
+            self._last_left_click = timestamp
+            self._double_ready = True
+            return 1
+        elapsed = (timestamp - self._last_left_click) * 1000
+        if elapsed <= self.double_click_ms:
+            self._last_left_click = None
+            self._double_ready = False
+            return 2
+        self._last_left_click = timestamp
+        self._double_ready = True
+        return 1
+
+    def hand_lost(self) -> ModeEvent:
+        was_dragging = self.dragging
+        self.dragging = False
+        self.mode = "NONE"
+        self._fist_start = None
+        return ModeEvent(
+            mode="NONE",
+            pose="NO HAND",
+            paused=self.paused,
+            drag_ended=was_dragging,
+        )
+
+
 def get_pointer_anchor(
     landmarks: Sequence[Sequence[float]],
     anchor: str = "palm",
@@ -377,7 +565,7 @@ class HandInteractionStateMachine:
                     self.press_releases.append((held_ms, 0.0))
                     return InteractionEvent(state="READY")
                 quick_click = held_ms < self.click_max_duration * 1000.0
-                was_dragging = held_ms >= self.drag_hold_ms
+                was_dragging = False
                 self.mode = None
                 self._press_time = None
                 self.state = "CLICK" if quick_click else "READY"
@@ -390,11 +578,6 @@ class HandInteractionStateMachine:
                     left_clicked=quick_click,
                     drag_ended=was_dragging,
                 )
-            if elapsed_ms >= self.drag_hold_ms:
-                if self.state != "DRAGGING":
-                    self.state = "DRAGGING"
-                    return InteractionEvent(state="DRAGGING", drag_started=True)
-                return InteractionEvent(state="DRAGGING")
             self.state = "PINCHING"
             return InteractionEvent(state="PINCHING")
 

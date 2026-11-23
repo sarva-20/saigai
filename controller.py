@@ -109,6 +109,32 @@ class Controller:
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
         return True
 
+    def left_click(self, x: float, y: float, click_count: int = 1) -> bool:
+        if not self.live:
+            return False
+        try:
+            import Quartz
+        except ImportError as exc:
+            raise RuntimeError("Quartz mouse control requires macOS") from exc
+        point = Quartz.CGPoint(x=x, y=y)
+        for event_type in (
+            Quartz.kCGEventLeftMouseDown,
+            Quartz.kCGEventLeftMouseUp,
+        ):
+            event = Quartz.CGEventCreateMouseEvent(
+                None,
+                event_type,
+                point,
+                Quartz.kCGMouseButtonLeft,
+            )
+            Quartz.CGEventSetIntegerValueField(
+                event,
+                Quartz.kCGMouseEventClickState,
+                click_count,
+            )
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        return True
+
     def scroll(self, delta: float, x: Optional[float] = None, y: Optional[float] = None) -> bool:
         if not self.live:
             return False

@@ -14,6 +14,10 @@ from config import GESTURE_THRESHOLDS
 from gestures import (
     OneEuroFilter,
     HandInteractionStateMachine,
+    InteractionEvent,
+    ModeStateMachine,
+    PoseDebouncer,
+    classify_hand_pose,
     PointerHistory,
     RatioMedianFilter,
     calibrated_pinch_thresholds,
@@ -501,6 +505,14 @@ def main() -> None:
         click_flash_ms=GESTURE_THRESHOLDS.click_flash_ms,
         min_pinch_ms=GESTURE_THRESHOLDS.min_pinch_ms,
     )
+    pose_debounce = PoseDebouncer(
+        GESTURE_THRESHOLDS.pose_stable_frames,
+        GESTURE_THRESHOLDS.pose_exit_frames,
+    )
+    mode_state = ModeStateMachine(
+        GESTURE_THRESHOLDS.clutch_hold_ms,
+        GESTURE_THRESHOLDS.double_click_ms,
+    )
     scroll = ScrollStateMachine(
         sensitivity=GESTURE_THRESHOLDS.scroll_sensitivity,
         dead_zone=GESTURE_THRESHOLDS.scroll_dead_zone,
@@ -553,6 +565,20 @@ def main() -> None:
                     GESTURE_THRESHOLDS.palm_anchor_mcp_weight,
                 )
                 timestamp_seconds = timestamp_ms / 1000.0
+                current_pose = classify_hand_pose(
+                    hands[0],
+                    GESTURE_THRESHOLDS.finger_extension_threshold,
+                )
+                active_pose = pose_debounce.update(current_pose)
+                mode_event = mode_state.update_pose(active_pose, timestamp_seconds)
+                if mode_event.drag_started:
+                    output.set_dragging(True)
+                    controller.mouse_down(*cursor_position)
+                    event_log.add(timestamp_seconds, "DRAG START")
+                if mode_event.drag_ended:
+                    output.set_dragging(False)
+                    controller.mouse_up(*cursor_position)
+                    event_log.add(timestamp_seconds, "DRAG END")
                 pinch_ratio = pinch_filter(
                     left_ratio_median.update(normalized_pinch_distance(hands[0])),
                     timestamp_seconds,
@@ -562,10 +588,10 @@ def main() -> None:
                     timestamp_seconds,
                 )
                 pinch_history.append((timestamp_seconds, pinch_ratio))
-                interaction_event = interaction.update(
-                    pinch_ratio,
-                    right_ratio,
-                    timestamp_seconds,
+                interaction_event = (
+                    interaction.update(pinch_ratio, right_ratio, timestamp_seconds)
+                    if mode_event.mode == "POINT"
+                    else interaction.reset()
                 )
                 if interaction_event.left_pressed or interaction_event.right_pressed:
                     pinch_press_timestamp = timestamp_seconds
@@ -586,9 +612,11 @@ def main() -> None:
                 scroll_event = scroll.update(
                     hands[0],
                     timestamp_seconds,
-                    pinch_active=(
-                        interaction.mode is not None
-                    ),
+                    pinch_active=(mode_event.mode != "SCROLL"),
+                ) if mode_event.mode == "SCROLL" else scroll.update(
+                    None,
+                    timestamp_seconds,
+                    pinch_active=True,
                 )
 
                 if GESTURE_THRESHOLDS.pointer_mode == "relative":
@@ -626,6 +654,23 @@ def main() -> None:
                     )
                 else:
                     raise ValueError("pointer_mode must be 'absolute' or 'relative'")
+                if mode_event.mode == "THREE":
+                    centroid = (
+                        sum(hands[0][index][0] for index in (8, 12, 16)) / 3.0,
+                        sum(hands[0][index][1] for index in (8, 12, 16)) / 3.0,
+                        sum(hands[0][index][2] for index in (8, 12, 16)) / 3.0,
+                    )
+                    raw_position = map_pointer_to_screen(
+                        centroid,
+                        frame.shape[1],
+                        frame.shape[0],
+                        screen_width,
+                        screen_height,
+                        GESTURE_THRESHOLDS.active_region_margin,
+                        active_region,
+                        GESTURE_THRESHOLDS.invert_x,
+                        GESTURE_THRESHOLDS.invert_y,
+                    )
                 previous_anchor = anchor
                 previous_pointer_time = timestamp_seconds
                 history.add(raw_position, timestamp_seconds)
@@ -647,33 +692,35 @@ def main() -> None:
                     ) or cursor_position
                 elif interaction_event.left_released:
                     output.set_dragging(False)
-                    if interaction_event.drag_ended:
-                        controller.mouse_up(*press_position)
-                        event_log.add(timestamp_seconds, "DRAG END")
-                    elif interaction_event.left_clicked:
+                    if interaction_event.left_clicked:
                         event_log.add(timestamp_seconds, "CLICK")
                         if args.live:
                             controller.move_mouse(*press_position)
-                            # Send down/up together now that the gesture is confirmed quick.
-                            controller.mouse_down(*press_position)
-                            controller.mouse_up(*press_position)
+                            click_count = mode_state.left_click(timestamp_seconds)
+                            controller.left_click(
+                                *press_position,
+                                click_count=click_count,
+                            )
+                            if click_count == 2:
+                                event_log.add(timestamp_seconds, "DOUBLE CLICK")
                 elif interaction_event.right_clicked:
                     event_log.add(timestamp_seconds, "RIGHT CLICK")
                     controller.right_click(*press_position)
 
-                if interaction.mode == "left" and interaction_event.state == "DRAGGING":
-                    if interaction_event.drag_started:
-                        event_log.add(timestamp_seconds, "DRAG START")
-                        controller.mouse_down(*press_position)
-                    if freeze_frames > 0:
-                        freeze_frames -= 1
-                    else:
-                        cursor_x = x_filter(raw_position[0], timestamp_seconds)
-                        cursor_y = y_filter(raw_position[1], timestamp_seconds)
-                        cursor_position = (cursor_x, cursor_y)
-                        output.set_target(cursor_position)
-                        output.set_dragging(True)
-                elif scroll_event.active:
+                if mode_event.paused:
+                    output.set_enabled(False)
+                    output.set_dragging(False)
+                    if not args.live:
+                        cv2.putText(frame, "PAUSED", (10, 65),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                elif mode_event.mode == "THREE":
+                    cursor_x = x_filter(raw_position[0], timestamp_seconds)
+                    cursor_y = y_filter(raw_position[1], timestamp_seconds)
+                    cursor_position = (cursor_x, cursor_y)
+                    output.set_enabled(True)
+                    output.set_dragging(True)
+                    output.set_target(cursor_position)
+                elif mode_event.mode == "SCROLL" and scroll_event.active:
                     output.set_enabled(False)
                     if scroll_event.sent_amount:
                         controller.scroll(
@@ -692,6 +739,8 @@ def main() -> None:
                             (255, 0, 0),
                             2,
                         )
+                elif mode_event.mode != "POINT":
+                    pass
                 elif freeze_frames > 0:
                     freeze_frames -= 1
                 elif is_still:
@@ -707,17 +756,22 @@ def main() -> None:
                     state = interaction_event.state
                     cv2.putText(
                         frame,
-                        state,
+                        f"{active_pose or 'UNKNOWN'} / {mode_event.mode}",
                         (10, 65),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (0, 0, 255) if state in ("PINCHING", "DRAGGING") else (0, 255, 0),
+                        1.1,
+                        (0, 255, 255),
                         2,
                     )
             else:
                 previous_anchor = None
                 previous_pointer_time = None
                 interaction_event = interaction.reset()
+                mode_event = mode_state.hand_lost()
+                if mode_event.drag_ended:
+                    output.set_dragging(False)
+                    controller.mouse_up(*cursor_position)
+                    event_log.add(timestamp_ms / 1000.0, "DRAG END")
                 scroll_event = scroll.update(None, timestamp_ms / 1000.0)
                 if interaction_event.drag_ended:
                     output.set_dragging(False)

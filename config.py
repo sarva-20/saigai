@@ -46,6 +46,10 @@ class GestureThresholds:
     active_region_margin: float = 0.20
     one_euro_min_cutoff: float = 1.0
     one_euro_beta: float = 0.007
+    pose_stable_frames: int = 5
+    pose_exit_frames: int = 3
+    double_click_ms: float = 400.0
+    clutch_hold_ms: float = 700.0
 
 
 GESTURE_THRESHOLDS = GestureThresholds()

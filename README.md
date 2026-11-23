@@ -54,3 +54,7 @@ every 0.5 seconds for approximately 5 seconds without opening the camera.
 Run `python main.py --calibrate-pinch` to sample relaxed and pinched poses twice.
 The saved left/right press and release thresholds are loaded from
 `calibration.json` automatically.
+
+Saigai uses debounced hand poses: POINT moves and clicks, SCROLL scrolls,
+THREE enables three-finger drag, FOUR/OPEN/FIST are detected, and a held FIST
+toggles pause. Pinches are click-only; no pinch hold is required for dragging.
